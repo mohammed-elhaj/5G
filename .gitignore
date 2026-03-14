@@ -1,0 +1,33 @@
+# Build directory
+build/
+
+# Object files
+*.o
+*.obj
+
+# Compiled binaries
+5g_layer2
+test_pdcp
+test_rlc
+test_mac
+test_integration
+
+# CMake generated files
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+
+# Profiling output (regenerated on each run)
+profiling_results.csv
+profiling_*.csv
+
+# Plan document
+plan.md
+
+# Editor / IDE files
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
