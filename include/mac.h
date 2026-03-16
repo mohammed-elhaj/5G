@@ -24,11 +24,18 @@ class MacLayer {
 public:
     explicit MacLayer(const Config& cfg);
 
-    /// Uplink TX: pack multiple SDUs into one Transport Block.
+    /// Uplink TX: pack multiple SDUs into one Transport Block (V1 — single LCID).
     ByteBuffer process_tx(const std::vector<ByteBuffer>& sdus);
 
-    /// Downlink RX: extract SDUs from one Transport Block.
+    /// Uplink TX: multi-LCID — pack SDUs from multiple logical channels.
+    /// Channels are served in LcData.priority order (lower value = higher priority).
+    ByteBuffer process_tx(std::vector<LcData> channels);
+
+    /// Downlink RX: extract SDUs from one Transport Block (V1 — discards LCID).
     std::vector<ByteBuffer> process_rx(const ByteBuffer& transport_block);
+
+    /// Downlink RX: multi-LCID — returns SDUs tagged with their LCID.
+    std::vector<std::pair<uint8_t, ByteBuffer>> process_rx_multi(const ByteBuffer& transport_block);
 
     void reset();
 

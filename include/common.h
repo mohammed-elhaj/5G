@@ -48,8 +48,27 @@ struct Config {
     uint32_t rlc_max_pdu_size    = 500;     // simulates MAC grant size
 
     // --- MAC (TS 38.321 simplified) ---
-    uint8_t  logical_channel_id  = 4;       // DTCH (LCID 4 for first DRB)
-    uint32_t transport_block_size = 2048;   // fixed TB size for V1
+    uint8_t  logical_channel_id   = 4;       // DTCH (LCID 4 for first DRB)
+    uint32_t transport_block_size = 2048;    // fixed TB size for V1
+
+    // NEW — added by Pair C Member 5 for multi-LCID + LCP support
+    uint8_t  num_logical_channels = 1;       // default: single channel (V1 behavior)
+    bool     lcp_enabled          = false;   // default: off (V1 behavior)
+
+    // NEW — added by Pair C Member 6 for BSR MAC CE
+    bool     bsr_enabled          = false;   // default: off (V1 behavior)
+};
+
+// ============================================================
+// LcData — per-call logical channel descriptor for multi-LCID TX.
+// Used by MacLayer::process_tx(vector<LcData>).
+// Added by Pair C Member 5.
+// ============================================================
+struct LcData {
+    uint8_t               lcid      = 4;           // Logical Channel ID (DRB: 4-7)
+    uint8_t               priority  = 0;           // lower = higher priority (3GPP LCP)
+    uint32_t              pbr_bytes = 0xFFFFFFFF;  // Prioritized Bit Rate quota (bytes)
+    std::vector<ByteBuffer> sdus;
 };
 
 // ============================================================
