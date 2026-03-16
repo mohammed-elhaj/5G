@@ -210,6 +210,85 @@ static void test_padding() {
     PASS();
 }
 
+// ============================================================
+// profile_variants() — MAC Layer independent profiling
+// Follows testing_and_profiling_guide.md §3 template exactly.
+// No assertions — stdout only, cannot affect exit code.
+// AI-assisted: reviewed by Member 5
+// ============================================================
+#include <chrono>
+#include <iomanip>
+
+static void profile_variants() {
+    const int ITERATIONS = 1000;
+    const std::vector<uint32_t> packet_sizes = {100, 500, 1000, 1400, 3000};
+
+    std::cout << "\n========================================" << std::endl;
+    std::cout << "PROFILING: MAC Layer" << std::endl;
+    std::cout << "========================================\n" << std::endl;
+
+    std::cout << std::left
+              << std::setw(12) << "PktSize"
+              << std::setw(16) << "Variant"
+              << std::setw(14) << "TX avg(us)"
+              << std::setw(14) << "RX avg(us)"
+              << std::setw(14) << "Overhead(B)"
+              << std::setw(10) << "Pass"
+              << std::endl;
+    std::cout << std::string(80, '-') << std::endl;
+
+    for (uint32_t pkt_size : packet_sizes) {
+        // ---------- V1-Baseline: single LCID, no LCP, no BSR ----------
+        Config cfg;
+        // TB must be large enough to hold the SDU + subheader (3 bytes max)
+        cfg.transport_block_size = (pkt_size + 3 > 2048) ? pkt_size + 64 : 2048;
+        cfg.logical_channel_id   = 4;
+        MacLayer mac(cfg);
+
+        ByteBuffer input = make_test_sdu(pkt_size, 0xAB);
+
+        double total_tx = 0.0, total_rx = 0.0;
+        bool all_pass = true;
+
+        for (int i = 0; i < ITERATIONS; i++) {
+            auto t0 = std::chrono::high_resolution_clock::now();
+            ByteBuffer tb = mac.process_tx({input});
+            auto t1 = std::chrono::high_resolution_clock::now();
+            auto sdus = mac.process_rx(tb);
+            auto t2 = std::chrono::high_resolution_clock::now();
+
+            total_tx += std::chrono::duration<double, std::micro>(t1 - t0).count();
+            total_rx += std::chrono::duration<double, std::micro>(t2 - t1).count();
+
+            if (i == 0 && (sdus.empty() || !buffers_equal(sdus[0], input)))
+                all_pass = false;
+        }
+
+        // Overhead = subheader bytes only (2 for SDU<=255B, 3 for larger)
+        size_t overhead = (pkt_size > 255) ? 3 : 2;
+
+        // MAC efficiency: actual SDU bytes / TB size
+        double efficiency = static_cast<double>(pkt_size) /
+                            static_cast<double>(cfg.transport_block_size) * 100.0;
+
+        std::cout << std::left
+                  << std::setw(12) << pkt_size
+                  << std::setw(16) << "V1-Baseline"
+                  << std::setw(14) << std::fixed << std::setprecision(2)
+                  << (total_tx / ITERATIONS)
+                  << std::setw(14) << (total_rx / ITERATIONS)
+                  << std::setw(14) << overhead
+                  << std::setw(10) << (all_pass ? "PASS" : "FAIL")
+                  << std::endl;
+
+        if (pkt_size == 1400) {
+            std::cout << "  MAC Efficiency (pkt=" << pkt_size << "B, TB=2048B): "
+                      << std::fixed << std::setprecision(1) << efficiency << "%\n";
+        }
+    }
+    std::cout << std::endl;
+}
+
 int main() {
     std::cout << "==============================\n";
     std::cout << " MAC Layer Unit Tests\n";
@@ -222,5 +301,8 @@ int main() {
     test_padding();
 
     std::cout << "\n  " << tests_passed << " / " << tests_run << " tests passed\n";
+
+    profile_variants();
+
     return (tests_passed == tests_run) ? 0 : 1;
 }
