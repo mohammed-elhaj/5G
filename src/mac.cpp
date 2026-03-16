@@ -65,17 +65,23 @@ ByteBuffer MacLayer::process_tx(const std::vector<ByteBuffer>& sdus) {
 }
 
 // ============================================================
-// TX path — Multi-LCID multiplexing
+// TX path — Multi-LCID multiplexing with optional LCP scheduling
 //
-// Channels are served in priority order (lower value = higher priority).
-// Without LCP (lcp_enabled=false): round-robin in priority order, no quota.
-// With LCP (lcp_enabled=true): PBR phase then round-robin (Phase 2 adds this).
+// When lcp_enabled=false (default / V1 behavior):
+//   Channels are served in priority order, all SDUs, no quota.
+//
+// When lcp_enabled=true (Phase 2 / LCP per TS 38.321 §5.4.3.1):
+//   Step 1 — PBR phase: serve each channel in priority order up to
+//             pbr_bytes worth of SDU data (or until drained).
+//   Step 2 — Round-robin phase: cycle through channels with leftover
+//             SDUs, one SDU at a time, until TB full or all drained.
 //
 // Fix vs V1: TB is allocated without zero-fill; only the padding region
 // is zeroed. This eliminates ~2KB of wasted writes per call.
 //
 // MAC PDU order (TS 38.321 / AI_RULES Pair C):
 //   SDUs → padding subheader → zeros
+// AI-assisted: reviewed by Member 5
 // ============================================================
 ByteBuffer MacLayer::process_tx(std::vector<LcData> channels) {
     // Sort channels by priority (lower number = higher priority per 3GPP LCP)
@@ -89,17 +95,67 @@ ByteBuffer MacLayer::process_tx(std::vector<LcData> channels) {
     size_t pos     = 0;
     size_t tb_size = config_.transport_block_size;
 
-    // Write SDUs from each channel in priority order (basic, no LCP quota yet)
-    for (auto& ch : channels) {
-        for (const auto& sdu : ch.sdus) {
-            size_t written = write_sdu(tb.data, pos, tb_size, ch.lcid, sdu);
-            if (written == 0) {
-                std::cerr << "  [MAC TX] WARNING: TB full, skipping SDU (LCID="
-                          << static_cast<int>(ch.lcid) << " size=" << sdu.size() << ")\n";
-                continue;
+    if (!config_.lcp_enabled) {
+        // --- Simple path: priority order, no quota ---
+        for (auto& ch : channels) {
+            for (const auto& sdu : ch.sdus) {
+                size_t written = write_sdu(tb.data, pos, tb_size, ch.lcid, sdu);
+                if (written == 0) break;  // TB full
+                pos += written;
             }
-            pos += written;
         }
+    } else {
+        // --- LCP path: PBR phase + round-robin phase ---
+
+        // Track per-channel SDU cursor and remaining PBR quota
+        struct ChState {
+            size_t   sdu_idx   = 0;
+            uint32_t pbr_left  = 0;
+        };
+        std::vector<ChState> state(channels.size());
+        for (size_t i = 0; i < channels.size(); i++)
+            state[i].pbr_left = channels[i].pbr_bytes;
+
+        // Step 1: PBR phase — serve each channel up to its PBR quota
+        for (size_t i = 0; i < channels.size(); i++) {
+            auto& ch  = channels[i];
+            auto& st  = state[i];
+            uint32_t bytes_sent = 0;
+
+            while (st.sdu_idx < ch.sdus.size()) {
+                const auto& sdu = ch.sdus[st.sdu_idx];
+                uint32_t sdu_len = static_cast<uint32_t>(sdu.size());
+
+                if (bytes_sent + sdu_len > st.pbr_left) break;  // PBR quota exhausted
+
+                size_t written = write_sdu(tb.data, pos, tb_size, ch.lcid, sdu);
+                if (written == 0) goto lcp_done;  // TB full
+                pos       += written;
+                bytes_sent += sdu_len;
+                st.sdu_idx++;
+            }
+        }
+
+        // Step 2: Round-robin phase — cycle through remaining SDUs
+        {
+            bool progress = true;
+            while (progress) {
+                progress = false;
+                for (size_t i = 0; i < channels.size(); i++) {
+                    auto& ch = channels[i];
+                    auto& st = state[i];
+                    if (st.sdu_idx >= ch.sdus.size()) continue;
+
+                    size_t written = write_sdu(tb.data, pos, tb_size,
+                                               ch.lcid, ch.sdus[st.sdu_idx]);
+                    if (written == 0) goto lcp_done;  // TB full
+                    pos += written;
+                    st.sdu_idx++;
+                    progress = true;
+                }
+            }
+        }
+        lcp_done:;
     }
 
     // Padding subheader + zero-fill only the remaining bytes (not the entire TB)

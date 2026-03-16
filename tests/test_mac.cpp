@@ -285,6 +285,102 @@ static void profile_variants() {
             std::cout << "  MAC Efficiency (pkt=" << pkt_size << "B, TB=2048B): "
                       << std::fixed << std::setprecision(1) << efficiency << "%\n";
         }
+
+        // ---------- Multi-LCID: 2 channels, LCP off ----------
+        {
+            Config cfg2;
+            cfg2.transport_block_size = (pkt_size + 3 > 2048) ? pkt_size * 2 + 64 : 2048;
+            cfg2.num_logical_channels = 2;
+            cfg2.lcp_enabled          = false;
+            MacLayer mac2(cfg2);
+
+            // Split input bytes across 2 LCIDs (LCID 4 and 5)
+            uint32_t half = pkt_size / 2;
+            ByteBuffer sdu4 = make_test_sdu(half,           0xAB);
+            ByteBuffer sdu5 = make_test_sdu(pkt_size - half, 0xCD);
+
+            LcData ch4; ch4.lcid = 4; ch4.priority = 1; ch4.pbr_bytes = 0xFFFFFFFF; ch4.sdus = {sdu4};
+            LcData ch5; ch5.lcid = 5; ch5.priority = 2; ch5.pbr_bytes = 0xFFFFFFFF; ch5.sdus = {sdu5};
+
+            double total_tx2 = 0.0, total_rx2 = 0.0;
+            bool all_pass2 = true;
+
+            for (int i = 0; i < ITERATIONS; i++) {
+                auto t0 = std::chrono::high_resolution_clock::now();
+                ByteBuffer tb = mac2.process_tx({ch4, ch5});
+                auto t1 = std::chrono::high_resolution_clock::now();
+                auto tagged = mac2.process_rx_multi(tb);
+                auto t2 = std::chrono::high_resolution_clock::now();
+
+                total_tx2 += std::chrono::duration<double, std::micro>(t1 - t0).count();
+                total_rx2 += std::chrono::duration<double, std::micro>(t2 - t1).count();
+
+                if (i == 0) {
+                    if (tagged.size() != 2) { all_pass2 = false; continue; }
+                    if (!buffers_equal(tagged[0].second, sdu4)) all_pass2 = false;
+                    if (!buffers_equal(tagged[1].second, sdu5)) all_pass2 = false;
+                }
+            }
+
+            size_t overhead2 = (half > 255 ? 3 : 2) + ((pkt_size - half) > 255 ? 3 : 2);
+            std::cout << std::left
+                      << std::setw(12) << pkt_size
+                      << std::setw(16) << "Multi-LCID"
+                      << std::setw(14) << std::fixed << std::setprecision(2)
+                      << (total_tx2 / ITERATIONS)
+                      << std::setw(14) << (total_rx2 / ITERATIONS)
+                      << std::setw(14) << overhead2
+                      << std::setw(10) << (all_pass2 ? "PASS" : "FAIL")
+                      << std::endl;
+        }
+
+        // ---------- LCP-On: 2 channels, LCP enabled ----------
+        {
+            Config cfg3;
+            cfg3.transport_block_size = (pkt_size + 3 > 2048) ? pkt_size * 2 + 64 : 2048;
+            cfg3.num_logical_channels = 2;
+            cfg3.lcp_enabled          = true;
+            MacLayer mac3(cfg3);
+
+            uint32_t half = pkt_size / 2;
+            ByteBuffer sdu4 = make_test_sdu(half,           0xAB);
+            ByteBuffer sdu5 = make_test_sdu(pkt_size - half, 0xCD);
+
+            // ch4 has higher priority and PBR covering all its data
+            LcData ch4; ch4.lcid = 4; ch4.priority = 1; ch4.pbr_bytes = pkt_size; ch4.sdus = {sdu4};
+            LcData ch5; ch5.lcid = 5; ch5.priority = 2; ch5.pbr_bytes = pkt_size; ch5.sdus = {sdu5};
+
+            double total_tx3 = 0.0, total_rx3 = 0.0;
+            bool all_pass3 = true;
+
+            for (int i = 0; i < ITERATIONS; i++) {
+                auto t0 = std::chrono::high_resolution_clock::now();
+                ByteBuffer tb = mac3.process_tx({ch4, ch5});
+                auto t1 = std::chrono::high_resolution_clock::now();
+                auto tagged = mac3.process_rx_multi(tb);
+                auto t2 = std::chrono::high_resolution_clock::now();
+
+                total_tx3 += std::chrono::duration<double, std::micro>(t1 - t0).count();
+                total_rx3 += std::chrono::duration<double, std::micro>(t2 - t1).count();
+
+                if (i == 0) {
+                    if (tagged.size() != 2) { all_pass3 = false; continue; }
+                    if (!buffers_equal(tagged[0].second, sdu4)) all_pass3 = false;
+                    if (!buffers_equal(tagged[1].second, sdu5)) all_pass3 = false;
+                }
+            }
+
+            size_t overhead3 = (half > 255 ? 3 : 2) + ((pkt_size - half) > 255 ? 3 : 2);
+            std::cout << std::left
+                      << std::setw(12) << pkt_size
+                      << std::setw(16) << "LCP-On"
+                      << std::setw(14) << std::fixed << std::setprecision(2)
+                      << (total_tx3 / ITERATIONS)
+                      << std::setw(14) << (total_rx3 / ITERATIONS)
+                      << std::setw(14) << overhead3
+                      << std::setw(10) << (all_pass3 ? "PASS" : "FAIL")
+                      << std::endl;
+        }
     }
     std::cout << std::endl;
 }
