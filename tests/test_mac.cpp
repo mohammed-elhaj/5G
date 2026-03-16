@@ -211,6 +211,121 @@ static void test_padding() {
 }
 
 // ============================================================
+// New functional tests — added below existing 5 (never modify above)
+// ============================================================
+
+// ---- Test: multi-LCID mux/demux round-trip ----
+static void test_multi_lcid_mux_demux() {
+    TEST("Multi-LCID mux/demux (LCID 4 + LCID 5, 2 SDUs each)");
+
+    Config cfg;
+    cfg.transport_block_size = 2048;
+    cfg.lcp_enabled          = false;
+    MacLayer mac(cfg);
+
+    ByteBuffer sdu4a = make_test_sdu(80,  0x11);
+    ByteBuffer sdu4b = make_test_sdu(90,  0x22);
+    ByteBuffer sdu5a = make_test_sdu(70,  0x33);
+    ByteBuffer sdu5b = make_test_sdu(100, 0x44);
+
+    LcData ch4; ch4.lcid = 4; ch4.priority = 1; ch4.pbr_bytes = 0xFFFFFFFF;
+    ch4.sdus = {sdu4a, sdu4b};
+    LcData ch5; ch5.lcid = 5; ch5.priority = 2; ch5.pbr_bytes = 0xFFFFFFFF;
+    ch5.sdus = {sdu5a, sdu5b};
+
+    ByteBuffer tb = mac.process_tx({ch4, ch5});
+    auto tagged = mac.process_rx_multi(tb);
+
+    if (tagged.size() != 4) {
+        FAIL("Expected 4 tagged SDUs, got " + std::to_string(tagged.size()));
+        return;
+    }
+    // Priority order: ch4 (prio=1) first, ch5 (prio=2) second
+    if (tagged[0].first != 4 || !buffers_equal(tagged[0].second, sdu4a)) { FAIL("SDU0 mismatch"); return; }
+    if (tagged[1].first != 4 || !buffers_equal(tagged[1].second, sdu4b)) { FAIL("SDU1 mismatch"); return; }
+    if (tagged[2].first != 5 || !buffers_equal(tagged[2].second, sdu5a)) { FAIL("SDU2 mismatch"); return; }
+    if (tagged[3].first != 5 || !buffers_equal(tagged[3].second, sdu5b)) { FAIL("SDU3 mismatch"); return; }
+
+    PASS();
+}
+
+// ---- Test: LCP priority ordering — high-priority LCID appears first in TB ----
+static void test_lcp_priority_ordering() {
+    TEST("LCP priority ordering (LCID 4 prio=1 appears before LCID 5 prio=2)");
+
+    Config cfg;
+    cfg.transport_block_size = 2048;
+    cfg.lcp_enabled          = true;
+    MacLayer mac(cfg);
+
+    ByteBuffer sdu4 = make_test_sdu(100, 0xAA);
+    ByteBuffer sdu5 = make_test_sdu(100, 0xBB);
+
+    // Pass ch5 first to verify sorting overrides input order
+    LcData ch5; ch5.lcid = 5; ch5.priority = 2; ch5.pbr_bytes = 512; ch5.sdus = {sdu5};
+    LcData ch4; ch4.lcid = 4; ch4.priority = 1; ch4.pbr_bytes = 512; ch4.sdus = {sdu4};
+
+    ByteBuffer tb = mac.process_tx({ch5, ch4});  // intentionally reversed order
+
+    // First subheader byte: [R=0][F=0][LCID=4] => 0x04
+    if ((tb.data[0] & 0x3F) != 4) {
+        FAIL("Expected LCID=4 first in TB, got LCID=" + std::to_string(tb.data[0] & 0x3F));
+        return;
+    }
+
+    // Verify full round-trip
+    auto tagged = mac.process_rx_multi(tb);
+    if (tagged.size() != 2 || tagged[0].first != 4 || tagged[1].first != 5) {
+        FAIL("Round-trip LCID order incorrect");
+        return;
+    }
+
+    PASS();
+}
+
+// ---- Test: LCP PBR quota — high-priority channel limited by PBR in phase 1 ----
+static void test_lcp_pbr_quota() {
+    TEST("LCP PBR quota (LCID 4 capped at 100B, remainder via round-robin)");
+
+    Config cfg;
+    cfg.transport_block_size = 2048;
+    cfg.lcp_enabled          = true;
+    MacLayer mac(cfg);
+
+    // ch4: priority=1, pbr=100B, 5 x 30B SDUs = 150B total
+    // ch5: priority=2, pbr=9999B, 1 x 200B SDU
+    LcData ch4; ch4.lcid = 4; ch4.priority = 1; ch4.pbr_bytes = 100;
+    for (int i = 0; i < 5; i++) ch4.sdus.push_back(make_test_sdu(30, static_cast<uint8_t>(i)));
+    LcData ch5; ch5.lcid = 5; ch5.priority = 2; ch5.pbr_bytes = 9999;
+    ch5.sdus.push_back(make_test_sdu(200, 0xFF));
+
+    ByteBuffer tb = mac.process_tx({ch4, ch5});
+    auto tagged = mac.process_rx_multi(tb);
+
+    // All 6 SDUs must be present (TB is 2048B, plenty of room)
+    if (tagged.size() != 6) {
+        FAIL("Expected 6 SDUs, got " + std::to_string(tagged.size()));
+        return;
+    }
+
+    // ch4 PBR=100B covers 3 SDUs of 30B each (90B <= 100B; 4th would be 120B > 100B).
+    // After PBR phase: ch4 has 3 sent. ch5 phase-1: all 200B sent.
+    // Round-robin phase: remaining 2 ch4 SDUs go next.
+    // Verify ch4 SDUs are at positions 0,1,2 (PBR phase) and 4,5 (RR phase)
+    // ch5 SDU at position 3.
+    bool ch4_first3 = (tagged[0].first == 4 && tagged[1].first == 4 && tagged[2].first == 4);
+    bool ch5_next   = (tagged[3].first == 5);
+    bool ch4_last2  = (tagged[4].first == 4 && tagged[5].first == 4);
+
+    if (!ch4_first3 || !ch5_next || !ch4_last2) {
+        FAIL("LCP scheduling order incorrect");
+        return;
+    }
+
+    PASS();
+}
+
+// ============================================================
 // profile_variants() — MAC Layer independent profiling
 // Follows testing_and_profiling_guide.md §3 template exactly.
 // No assertions — stdout only, cannot affect exit code.
@@ -395,6 +510,11 @@ int main() {
     test_multiple_sdus();
     test_mixed_sizes();
     test_padding();
+
+    // New tests — multi-LCID and LCP
+    test_multi_lcid_mux_demux();
+    test_lcp_priority_ordering();
+    test_lcp_pbr_quota();
 
     std::cout << "\n  " << tests_passed << " / " << tests_run << " tests passed\n";
 
