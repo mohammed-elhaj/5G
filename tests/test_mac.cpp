@@ -500,6 +500,26 @@ static void profile_variants() {
     std::cout << std::endl;
 }
 
+
+
+
+
+// AI-assisted: Member 6 - Unit test for BSR and Variable TB Truncation
+void test_member6_features() {
+    Config cfg;
+    MacLayer mac(cfg);
+    
+    std::vector<ByteBuffer> sdus(1);
+    sdus[0].data.resize(100, 0xAA);
+
+    size_t custom_tb = 50;
+    auto tb = mac.process_tx(sdus, custom_tb);
+
+    assert(tb.data.size() == 50); 
+    assert(tb.data[0] == 61);     
+    
+    std::cout << "  PASS: test_member6_features (BSR & Truncation)" << std::endl;
+}
 int main() {
     std::cout << "==============================\n";
     std::cout << " MAC Layer Unit Tests\n";
@@ -519,6 +539,6 @@ int main() {
     std::cout << "\n  " << tests_passed << " / " << tests_run << " tests passed\n";
 
     profile_variants();
-
+test_member6_features();
     return (tests_passed == tests_run) ? 0 : 1;
 }

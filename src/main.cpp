@@ -75,6 +75,13 @@ struct PacketProfile {
 
 int main(int argc, char* argv[]) {
     Config cfg = parse_args(argc, argv);
+    // AI-assisted: Member 6 - Check if variable TB size mode is enabled
+    bool use_variable_tb = false;
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--variable-tb") == 0) {
+            use_variable_tb = true;
+        }
+    }
 
     std::cout << "========================================\n";
     std::cout << " 5G NR Layer 2 Protocol Stack Simulator\n";
@@ -124,7 +131,14 @@ int main(int argc, char* argv[]) {
 
         // -- MAC TX (multiplex all RLC PDUs into one Transport Block) --
         t0 = Clock::now();
-        ByteBuffer transport_block = mac.process_tx(rlc_pdus);
+        // AI-assisted: Member 6 - Variable TB logic (cycle: 512, 1024, 2048)
+        size_t current_tb_size = cfg.transport_block_size;
+        if (use_variable_tb) {
+            static size_t sizes[] = {512, 1024, 2048};
+            static int cycle_count = 0;
+            current_tb_size = sizes[(cycle_count++) % 3];
+        }
+        ByteBuffer transport_block = mac.process_tx(rlc_pdus, current_tb_size);
         t1 = Clock::now();
         pp.mac_tx_us = elapsed_us(t0, t1);
 

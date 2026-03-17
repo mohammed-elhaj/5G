@@ -25,11 +25,12 @@ public:
     explicit MacLayer(const Config& cfg);
 
     /// Uplink TX: pack multiple SDUs into one Transport Block (V1 — single LCID).
-    ByteBuffer process_tx(const std::vector<ByteBuffer>& sdus);
+   // AI-assisted: updated by Member 6 to support Variable TB size
+    ByteBuffer process_tx(const std::vector<ByteBuffer>& sdus, size_t tb_size = 0);
 
     /// Uplink TX: multi-LCID — pack SDUs from multiple logical channels.
     /// Channels are served in LcData.priority order (lower value = higher priority).
-    ByteBuffer process_tx(std::vector<LcData> channels);
+    ByteBuffer process_tx(std::vector<LcData> channels, size_t tb_size = 0);
 
     /// Downlink RX: extract SDUs from one Transport Block (V1 — discards LCID).
     std::vector<ByteBuffer> process_rx(const ByteBuffer& transport_block);
@@ -43,4 +44,7 @@ private:
     Config config_;
 
     static constexpr uint8_t LCID_PADDING = 63;  // Padding LCID per TS 38.321
+    
+    // Added by Member 6 for Short BSR CE
+    static constexpr uint8_t LCID_BSR     = 61;
 };

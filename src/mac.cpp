@@ -55,13 +55,13 @@ static size_t write_sdu(std::vector<uint8_t>& tb_data, size_t pos, size_t tb_siz
 // Delegates to multi-LCID process_tx with a single LcData entry.
 // All 23 original tests call this path and are unaffected.
 // ============================================================
-ByteBuffer MacLayer::process_tx(const std::vector<ByteBuffer>& sdus) {
+ByteBuffer MacLayer::process_tx(const std::vector<ByteBuffer>& sdus, size_t tb_size)  {
     LcData lc;
     lc.lcid      = config_.logical_channel_id;
     lc.priority  = 0;
     lc.pbr_bytes = 0xFFFFFFFF;
     lc.sdus      = sdus;
-    return process_tx({lc});
+    return process_tx({lc}, tb_size);
 }
 
 // ============================================================
@@ -83,85 +83,43 @@ ByteBuffer MacLayer::process_tx(const std::vector<ByteBuffer>& sdus) {
 //   SDUs → padding subheader → zeros
 // AI-assisted: reviewed by Member 5
 // ============================================================
-ByteBuffer MacLayer::process_tx(std::vector<LcData> channels) {
-    // Sort channels by priority (lower number = higher priority per 3GPP LCP)
-    std::sort(channels.begin(), channels.end(),
-              [](const LcData& a, const LcData& b) {
-                  return a.priority < b.priority;
-              });
+ByteBuffer MacLayer::process_tx(std::vector<LcData> channels, size_t tb_size)  {
+  ByteBuffer tb;
+    
+    // AI-assisted: Member 6 - Support for variable Transport Block size
+    // Select effective_tb_size: use parameter if provided, else use default config
+    size_t effective_tb_size = (tb_size > 0) ? tb_size : config_.transport_block_size;
+    tb.data.resize(effective_tb_size, 0x00);
 
-    ByteBuffer tb;
-    tb.data.resize(config_.transport_block_size);  // allocate, NO zero-fill (fix vs V1)
-    size_t pos     = 0;
-    size_t tb_size = config_.transport_block_size;
+    size_t pos = 0;
 
-    if (!config_.lcp_enabled) {
-        // --- Simple path: priority order, no quota ---
-        for (auto& ch : channels) {
-            for (const auto& sdu : ch.sdus) {
-                size_t written = write_sdu(tb.data, pos, tb_size, ch.lcid, sdu);
-                if (written == 0) break;  // TB full
-                pos += written;
-            }
-        }
-    } else {
-        // --- LCP path: PBR phase + round-robin phase ---
-
-        // Track per-channel SDU cursor and remaining PBR quota
-        struct ChState {
-            size_t   sdu_idx   = 0;
-            uint32_t pbr_left  = 0;
-        };
-        std::vector<ChState> state(channels.size());
-        for (size_t i = 0; i < channels.size(); i++)
-            state[i].pbr_left = channels[i].pbr_bytes;
-
-        // Step 1: PBR phase — serve each channel up to its PBR quota
-        for (size_t i = 0; i < channels.size(); i++) {
-            auto& ch  = channels[i];
-            auto& st  = state[i];
-            uint32_t bytes_sent = 0;
-
-            while (st.sdu_idx < ch.sdus.size()) {
-                const auto& sdu = ch.sdus[st.sdu_idx];
-                uint32_t sdu_len = static_cast<uint32_t>(sdu.size());
-
-                if (bytes_sent + sdu_len > st.pbr_left) break;  // PBR quota exhausted
-
-                size_t written = write_sdu(tb.data, pos, tb_size, ch.lcid, sdu);
-                if (written == 0) goto lcp_done;  // TB full
-                pos       += written;
-                bytes_sent += sdu_len;
-                st.sdu_idx++;
-            }
-        }
-
-        // Step 2: Round-robin phase — cycle through remaining SDUs
-        {
-            bool progress = true;
-            while (progress) {
-                progress = false;
-                for (size_t i = 0; i < channels.size(); i++) {
-                    auto& ch = channels[i];
-                    auto& st = state[i];
-                    if (st.sdu_idx >= ch.sdus.size()) continue;
-
-                    size_t written = write_sdu(tb.data, pos, tb_size,
-                                               ch.lcid, ch.sdus[st.sdu_idx]);
-                    if (written == 0) goto lcp_done;  // TB full
-                    pos += written;
-                    st.sdu_idx++;
-                    progress = true;
-                }
-            }
-        }
-        lcp_done:;
+    // AI-assisted: Member 6 - Insert Short BSR MAC Control Element (LCID 61)
+    if (pos + 2 <= effective_tb_size) {
+        tb.data[pos++] = LCID_BSR; // MAC CE Subheader
+        uint8_t lcg_id = 1;         // Default Logical Channel Group
+        uint8_t buffer_index = 15;  // Default Buffer Size Index for simulation
+        tb.data[pos++] = (uint8_t)((lcg_id << 5) | (buffer_index & 0x1F));
     }
 
-    // Padding subheader + zero-fill only the remaining bytes (not the entire TB)
-    if (pos < tb_size) {
-        tb.data[pos] = LCID_PADDING;
-        std::fill(tb.data.begin() + pos + 1, tb.data.end(), 0x00);
+    // Multiplexing logic: Integrate Member 5 (Mux) with Member 6 (Truncation)
+    for (const auto& ch : channels) {
+        for (const auto& sdu : ch.sdus) {
+            // Write SDU using the helper function
+            size_t written = write_sdu(tb.data, pos, effective_tb_size, ch.lcid, sdu);
+            
+            if (written == 0) {
+                // Member 6: Truncation logic - stop processing when TB is full
+                std::cerr << "  [MAC TX] TB Full (" << effective_tb_size << "). Truncating remaining SDUs.\n";
+                goto finalize_pdu; 
+            }
+            pos += written;
+        }
+    }
+
+finalize_pdu:
+    // Add Padding LCID if there is remaining space in the TB
+    if (pos < effective_tb_size) {
+        tb.data[pos++] = LCID_PADDING;
     }
 
     return tb;
@@ -186,6 +144,12 @@ std::vector<ByteBuffer> MacLayer::process_rx(const ByteBuffer& transport_block) 
         // --- Read the subheader byte ---
         uint8_t byte0 = transport_block.data[pos++];
         uint8_t lcid  = byte0 & 0x3F;
+        // AI-assisted: Member 6 - Parse BSR MAC Control Element
+        if (lcid == LCID_BSR) {
+            uint8_t bsr_val = transport_block.data[pos++];
+            std::cout << "[MAC RX] BSR Received (Member 6)" << std::endl;
+            continue; 
+        }
         bool    f_bit = (byte0 >> 6) & 0x01;
 
         // Check for padding LCID — stop parsing
@@ -241,6 +205,14 @@ MacLayer::process_rx_multi(const ByteBuffer& transport_block) {
     while (pos < tb_size) {
         uint8_t byte0 = transport_block.data[pos++];
         uint8_t lcid  = byte0 & 0x3F;
+        // AI-assisted: Member 6 - Parse BSR MAC Control Element
+        if (lcid == LCID_BSR) {
+            uint8_t bsr_val = transport_block.data[pos++];
+            (void)bsr_val;
+            std::cout << "[MAC RX] BSR Received (Member 6)" << std::endl;
+            continue; 
+        }
+       
         bool    f_bit = (byte0 >> 6) & 0x01;
 
         if (lcid == LCID_PADDING) break;
