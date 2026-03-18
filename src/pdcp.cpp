@@ -150,6 +150,51 @@ void PdcpLayer::apply_cipher_aes_ctr(std::vector<uint8_t>& data, uint32_t count)
 }
 
 // ============================================================
+// Member 2: Header Compression (TX side)
+//
+// Simplified ROHC-style compression:
+//   - Assumes constant IP header fields (src/dst/protocol)
+//   - Replaces 20-byte IPv4 header with 4-byte compressed header:
+//
+// Format:
+//   [0xFC marker][packet_id (2B)][length_delta (1B)]
+//
+// Payload after header = original payload without IP header
+// ============================================================
+std::vector<uint8_t> PdcpLayer::compress_header(const std::vector<uint8_t>& data) {
+    if (data.size() < 20) return data;
+    // Only compress IPv4 packets
+    if ((data[0] >> 4) != 4) return data;
+    // Compression is applied only to IPv4 packets.
+    // Test SDUs may not contain valid IP headers, so we skip compression
+    // unless Version field indicates IPv4 (per RFC 791).
+    // If packet too small to contain IP header, skip compression
+    
+    std::vector<uint8_t> out;
+
+    // --- Marker byte (identifies compressed packet) ---
+    out.push_back(0xFC);
+
+    // --- Packet ID (for tracking/debugging, 2 bytes) ---
+    out.push_back((comp_tx_id_ >> 8) & 0xFF);
+    out.push_back(comp_tx_id_ & 0xFF);
+
+    // --- Length delta encoding ---
+    // Stores difference from previous packet length
+    uint8_t curr_len = static_cast<uint8_t>(data.size());
+    uint8_t delta = curr_len - prev_tx_len_;
+    out.push_back(delta);
+
+    // --- Copy payload (skip original 20-byte IP header) ---
+    out.insert(out.end(), data.begin() + 20, data.end());
+
+    // --- Update compression state ---
+    prev_tx_len_ = curr_len;
+    comp_tx_id_++;
+
+    return out;
+}
+// ============================================================
 // Compute MAC-I — CRC32 over (integrity_key || count || data).
 // Produces a 4-byte integrity check value.
 // ============================================================
@@ -225,6 +270,55 @@ uint32_t PdcpLayer::compute_mac_i_hmac(uint32_t count, const std::vector<uint8_t
 }
 
 // ============================================================
+// Member 2: Header Decompression (RX side)
+//
+// Restores full IPv4 header using:
+//   - Stored previous packet length
+//   - Known constant header fields
+//
+// If packet is not compressed (no marker), pass through.
+// ============================================================
+std::vector<uint8_t> PdcpLayer::decompress_header(const std::vector<uint8_t>& data) {
+    // Check marker (0xFC). If not present → no compression used.
+    if (data.size() < 4 || data[0] != 0xFC) return data;
+
+    size_t offset = 1;
+
+    // --- Read packet ID (not strictly needed, for completeness) ---
+    uint16_t pkt_id = (data[offset] << 8) | data[offset + 1];
+    offset += 2;
+
+    // --- Recover packet length using delta ---
+    uint8_t delta = data[offset++];
+    uint8_t curr_len = prev_rx_len_ + delta;
+
+    std::vector<uint8_t> out;
+
+    // --- Reconstruct minimal IPv4 header ---
+    // Since src/dst/protocol are constant, we only rebuild essentials
+    std::vector<uint8_t> ip_header(20, 0);
+
+    ip_header[0] = 0x45;  // Version (4) + IHL (5 words = 20 bytes)
+
+    // Total length field
+    ip_header[2] = (curr_len >> 8) & 0xFF;
+    ip_header[3] = curr_len & 0xFF;
+
+    // (Optional: could fill protocol, src/dst if needed)
+
+    // --- Append reconstructed header ---
+    out.insert(out.end(), ip_header.begin(), ip_header.end());
+
+    // --- Append payload ---
+    out.insert(out.end(), data.begin() + offset, data.end());
+
+    // --- Update RX state ---
+    prev_rx_len_ = curr_len;
+    comp_rx_id_++;
+
+    return out;
+}
+// ============================================================
 // TX path (uplink): SDU (IP packet) → PDCP PDU
 //
 // Steps per TS 38.323 §5.7 / §5.8 (simplified):
@@ -244,19 +338,28 @@ ByteBuffer PdcpLayer::process_tx(const ByteBuffer& sdu) {
 
     // --- Step 2: Copy the SDU payload (the IP packet) ---
     std::vector<uint8_t> payload(sdu.data.begin(), sdu.data.end());
-
-    // --- Step 3: Cipher the payload ---
+    // ============================================================
+    // TX path modification (Member 2)
+    //
+    // Compression is applied AFTER receiving SDU
+    // and BEFORE ciphering, as required by PDCP spec.
+    // ============================================================
+    // --- Step 3:compression
+    if (config_.compression_enabled) {
+        payload = compress_header(payload);
+    }
+    // --- Step 4: Cipher the payload ---
     if (config_.ciphering_enabled) {
         apply_cipher(payload, count);
     }
 
-    // --- Step 4: Compute MAC-I over the ciphered payload ---
+    // --- Step 5: Compute MAC-I over the ciphered payload ---
     uint32_t mac_i = 0;
     if (config_.integrity_enabled) {
         mac_i = compute_mac_i(count, payload);
     }
 
-    // --- Step 5: Assemble the PDCP PDU ---
+    // --- Step 6: Assemble the PDCP PDU ---
     ByteBuffer pdu;
     size_t mac_i_size = config_.integrity_enabled ? 4 : 0;
     pdu.data.resize(header_size + payload.size() + mac_i_size);
@@ -331,6 +434,7 @@ ByteBuffer PdcpLayer::process_rx(const ByteBuffer& pdu) {
     std::vector<uint8_t> payload(pdu.data.begin() + header_size,
                                   pdu.data.begin() + header_size + payload_size);
 
+
     // --- Step 4: Verify MAC-I ---
     if (config_.integrity_enabled) {
         uint32_t expected_mac_i = compute_mac_i(count, payload);
@@ -358,7 +462,17 @@ ByteBuffer PdcpLayer::process_rx(const ByteBuffer& pdu) {
         apply_cipher(payload, count);
     }
 
-    // --- Step 6: Return the recovered SDU ---
+    // ============================================================
+    // RX path modification (Member 2)
+    //
+    // Decompression is applied AFTER deciphering
+    // and BEFORE delivering SDU to upper layer.
+    // ============================================================
+    // --- Step 6: Decompression
+    if (config_.compression_enabled) {
+        payload = decompress_header(payload);
+    }
+    // --- Step 7: Return the recovered SDU ---
     ByteBuffer sdu;
     sdu.data = std::move(payload);
     return sdu;

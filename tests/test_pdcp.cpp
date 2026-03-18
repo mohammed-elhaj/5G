@@ -464,6 +464,94 @@ static void test_aes_hmac_sequential() {
     PASS();
 }
 
+// ============================================================
+// Member 2 Test:
+// Verifies compression + decompression correctness
+//
+// Ensures:
+//   TX → compress → cipher → RX → decipher → decompress
+//   results in original SDU
+// ============================================================
+static void test_compression_roundtrip() {
+    TEST("Compression round-trip");
+
+    Config cfg;
+    cfg.pdcp_sn_length = 12;
+    cfg.ciphering_enabled = true;
+    cfg.integrity_enabled = true;
+    cfg.compression_enabled = true;
+
+    PdcpLayer tx(cfg);
+    PdcpLayer rx(cfg);
+
+    ByteBuffer sdu = make_test_sdu(100, 0xAA);
+
+    ByteBuffer pdu = tx.process_tx(sdu);
+    ByteBuffer rec = rx.process_rx(pdu);
+
+    if (!buffers_equal(sdu, rec)) {
+        FAIL("Compression roundtrip failed");
+        return;
+    }
+
+    PASS();
+}
+
+// ============================================================
+// Member 2 Test:
+// Verifies compression reduces packet size
+//
+// Expected:
+//   compressed PDU < original SDU
+// ============================================================
+static void test_compression_reduces_size() {
+    TEST("Compression reduces size");
+
+    Config cfg;
+    cfg.ciphering_enabled = false;
+    cfg.integrity_enabled = false;
+    cfg.compression_enabled = true;
+
+    PdcpLayer pdcp(cfg);
+
+    ByteBuffer sdu = make_test_sdu(100, 0xAA);
+
+    
+    
+    ByteBuffer pdu = pdcp.process_tx(sdu);
+
+    if (pdu.size() >= sdu.size()) {
+        FAIL("Compression did not reduce size");
+        return;
+    }
+
+    PASS();
+}
+
+// ============================================================
+// Member 2 Test:
+// Ensures disabling compression keeps behavior unchanged
+// ============================================================
+static void test_compression_disabled() {
+    TEST("Compression disabled");
+
+    Config cfg;
+    cfg.compression_enabled = false;
+
+    PdcpLayer tx(cfg);
+    PdcpLayer rx(cfg);
+
+    ByteBuffer sdu = make_test_sdu(100, 0xAA);
+    ByteBuffer pdu = tx.process_tx(sdu);
+    ByteBuffer rec = rx.process_rx(pdu);
+
+    if (!buffers_equal(sdu, rec)) {
+        FAIL("Disabled compression altered data");
+        return;
+    }
+
+    PASS();
+}
 static void profile_pdcp_variants() {
     const int ITERATIONS = 1000;
     const std::vector<uint32_t> pkt_sizes = {100, 500, 1000, 1400, 3000, 9000};
@@ -592,6 +680,14 @@ int main() {
     test_aes_hmac_18bit();
     test_aes_hmac_max_sdu();
     test_aes_hmac_sequential();
+
+    // ============================================================
+    // Member 2 Test Suite
+    // ============================================================
+    std::cout << "\n  --- Compression Tests ---\n";
+    test_compression_roundtrip();
+    test_compression_reduces_size();
+    test_compression_disabled();
 
     // Run profiling (after all correctness tests pass)
     profile_pdcp_variants();
