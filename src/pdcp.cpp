@@ -19,6 +19,9 @@
 #include <iostream>
 #include <cstring>
 #include <stdexcept>
+#include <openssl/evp.h>
+#include <openssl/hmac.h>
+#include <openssl/err.h>
 
 // ============================================================
 // CRC32 lookup table (ISO 3309 / ITU-T V.42 polynomial 0xEDB88320)
@@ -77,10 +80,73 @@ std::vector<uint8_t> PdcpLayer::generate_keystream(uint32_t count, size_t length
 // deciphers.
 // ============================================================
 void PdcpLayer::apply_cipher(std::vector<uint8_t>& data, uint32_t count) {
-    auto ks = generate_keystream(count, data.size());
-    for (size_t i = 0; i < data.size(); i++) {
-        data[i] ^= ks[i];
+    if (config_.cipher_algorithm == 0) {
+        // V1: XOR stream cipher (original code, unchanged)
+        auto ks = generate_keystream(count, data.size());
+        for (size_t i = 0; i < data.size(); i++) {
+            data[i] ^= ks[i];
+        }
+    } else if (config_.cipher_algorithm == 1) {
+        // Optimized: AES-128-CTR (per TS 38.323 §5.8, NEA2)
+        apply_cipher_aes_ctr(data, count);
     }
+}
+
+// ============================================================
+// AES-128-CTR cipher — replaces XOR stream cipher when
+// config_.cipher_algorithm == 1.
+//
+// Per TS 38.323 §5.8, NEA2 uses AES-128 in CTR mode.
+// IV = COUNT(4 bytes) || BEARER(1 byte) || DIRECTION(1 byte) || zeros(10 bytes)
+//
+// AES-CTR is self-inverse: same operation encrypts and decrypts.
+// AI-assisted: reviewed by Member 1
+// ============================================================
+void PdcpLayer::apply_cipher_aes_ctr(std::vector<uint8_t>& data, uint32_t count) {
+    // Build 16-byte IV per TS 38.323 ciphering input parameters
+    uint8_t iv[16] = {0};
+    iv[0] = static_cast<uint8_t>((count >> 24) & 0xFF);
+    iv[1] = static_cast<uint8_t>((count >> 16) & 0xFF);
+    iv[2] = static_cast<uint8_t>((count >> 8) & 0xFF);
+    iv[3] = static_cast<uint8_t>(count & 0xFF);
+    iv[4] = 0x01;  // BEARER ID (single DRB)
+    iv[5] = 0x00;  // DIRECTION (0 for both TX/RX in loopback simulation)
+
+    EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+    if (!ctx) {
+        std::cerr << "[PDCP] Failed to create EVP cipher context\n";
+        return;
+    }
+
+    // AES-128-CTR: same call encrypts and decrypts
+    if (EVP_EncryptInit_ex(ctx, EVP_aes_128_ctr(), nullptr,
+                           config_.cipher_key, iv) != 1) {
+        std::cerr << "[PDCP] EVP_EncryptInit_ex failed\n";
+        EVP_CIPHER_CTX_free(ctx);
+        return;
+    }
+
+    std::vector<uint8_t> output(data.size() + EVP_CIPHER_block_size(EVP_aes_128_ctr()));
+    int out_len = 0;
+
+    if (EVP_EncryptUpdate(ctx, output.data(), &out_len,
+                          data.data(), static_cast<int>(data.size())) != 1) {
+        std::cerr << "[PDCP] EVP_EncryptUpdate failed\n";
+        EVP_CIPHER_CTX_free(ctx);
+        return;
+    }
+
+    int final_len = 0;
+    if (EVP_EncryptFinal_ex(ctx, output.data() + out_len, &final_len) != 1) {
+        std::cerr << "[PDCP] EVP_EncryptFinal_ex failed\n";
+        EVP_CIPHER_CTX_free(ctx);
+        return;
+    }
+
+    output.resize(out_len + final_len);
+    data = std::move(output);
+
+    EVP_CIPHER_CTX_free(ctx);
 }
 
 // ============================================================
@@ -88,23 +154,74 @@ void PdcpLayer::apply_cipher(std::vector<uint8_t>& data, uint32_t count) {
 // Produces a 4-byte integrity check value.
 // ============================================================
 uint32_t PdcpLayer::compute_mac_i(uint32_t count, const std::vector<uint8_t>& data) {
-    // Build the input buffer: integrity_key (16 bytes) + count (4 bytes) + data
-    std::vector<uint8_t> buf;
-    buf.reserve(16 + 4 + data.size());
+    if (config_.integrity_algorithm == 0) {
+        // V1: CRC32 integrity (original code, unchanged)
+        std::vector<uint8_t> buf;
+        buf.reserve(16 + 4 + data.size());
 
-    // Append the 16-byte integrity key
-    buf.insert(buf.end(), config_.integrity_key, config_.integrity_key + 16);
+        buf.insert(buf.end(), config_.integrity_key, config_.integrity_key + 16);
 
-    // Append count in big-endian
-    buf.push_back(static_cast<uint8_t>((count >> 24) & 0xFF));
-    buf.push_back(static_cast<uint8_t>((count >> 16) & 0xFF));
-    buf.push_back(static_cast<uint8_t>((count >> 8)  & 0xFF));
-    buf.push_back(static_cast<uint8_t>(count & 0xFF));
+        buf.push_back(static_cast<uint8_t>((count >> 24) & 0xFF));
+        buf.push_back(static_cast<uint8_t>((count >> 16) & 0xFF));
+        buf.push_back(static_cast<uint8_t>((count >> 8)  & 0xFF));
+        buf.push_back(static_cast<uint8_t>(count & 0xFF));
 
-    // Append the payload data
-    buf.insert(buf.end(), data.begin(), data.end());
+        buf.insert(buf.end(), data.begin(), data.end());
 
-    return crc32(buf.data(), buf.size());
+        return crc32(buf.data(), buf.size());
+    } else if (config_.integrity_algorithm == 1) {
+        // Optimized: HMAC-SHA256 (per TS 38.323 §5.9)
+        return compute_mac_i_hmac(count, data);
+    }
+
+    return 0;
+}
+
+// ============================================================
+// HMAC-SHA256 integrity — replaces CRC32 when
+// config_.integrity_algorithm == 1.
+//
+// Per TS 38.323 §5.9, integrity input includes COUNT, BEARER,
+// DIRECTION and the message. We compute HMAC-SHA256 and truncate
+// to 4 bytes to fit the MAC-I field.
+// AI-assisted: reviewed by Member 1
+// ============================================================
+uint32_t PdcpLayer::compute_mac_i_hmac(uint32_t count, const std::vector<uint8_t>& data) {
+    // Build integrity input: COUNT || BEARER || DIRECTION || payload
+    std::vector<uint8_t> message;
+    message.reserve(6 + data.size());
+
+    // COUNT (4 bytes, big-endian)
+    message.push_back(static_cast<uint8_t>((count >> 24) & 0xFF));
+    message.push_back(static_cast<uint8_t>((count >> 16) & 0xFF));
+    message.push_back(static_cast<uint8_t>((count >> 8) & 0xFF));
+    message.push_back(static_cast<uint8_t>(count & 0xFF));
+
+    // BEARER (1 byte)
+    message.push_back(0x01);
+
+    // DIRECTION (1 byte) — 0 for both TX/RX in loopback
+    message.push_back(0x00);
+
+    // Append the ciphered payload
+    message.insert(message.end(), data.begin(), data.end());
+
+    // Compute HMAC-SHA256 using the integrity key
+    unsigned char hmac_result[EVP_MAX_MD_SIZE];
+    unsigned int hmac_len = 0;
+
+    HMAC(EVP_sha256(),
+         config_.integrity_key, 16,
+         message.data(), message.size(),
+         hmac_result, &hmac_len);
+
+    // Truncate to 4 bytes for MAC-I field
+    uint32_t mac_i = (static_cast<uint32_t>(hmac_result[0]) << 24) |
+                     (static_cast<uint32_t>(hmac_result[1]) << 16) |
+                     (static_cast<uint32_t>(hmac_result[2]) << 8)  |
+                     (static_cast<uint32_t>(hmac_result[3]));
+
+    return mac_i;
 }
 
 // ============================================================

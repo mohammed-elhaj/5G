@@ -7,6 +7,9 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # Header files
 include_directories(${CMAKE_SOURCE_DIR}/include)
 
+# OpenSSL for PDCP security algorithms (AES-128-CTR, HMAC-SHA256)
+find_package(OpenSSL REQUIRED)
+
 # Main executable
 add_executable(5g_layer2
     src/main.cpp
@@ -15,12 +18,14 @@ add_executable(5g_layer2
     src/rlc.cpp
     src/mac.cpp
 )
+target_link_libraries(5g_layer2 OpenSSL::SSL OpenSSL::Crypto)
 
 # Unit tests — each links the layer sources it needs
 add_executable(test_pdcp
     tests/test_pdcp.cpp
     src/pdcp.cpp
 )
+target_link_libraries(test_pdcp OpenSSL::SSL OpenSSL::Crypto)
 
 add_executable(test_rlc
     tests/test_rlc.cpp
@@ -39,3 +44,4 @@ add_executable(test_integration
     src/rlc.cpp
     src/mac.cpp
 )
+target_link_libraries(test_integration OpenSSL::SSL OpenSSL::Crypto)

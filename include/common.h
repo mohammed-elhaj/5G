@@ -50,6 +50,12 @@ struct Config {
     // --- MAC (TS 38.321 simplified) ---
     uint8_t  logical_channel_id  = 4;       // DTCH (LCID 4 for first DRB)
     uint32_t transport_block_size = 2048;   // fixed TB size for V1
+
+    // === Member 1: PDCP algorithm selection ===
+    // 0 = V1 originals (XOR cipher, CRC32 integrity)
+    // 1 = Optimized (AES-128-CTR cipher, HMAC-SHA256 integrity)
+    uint8_t  cipher_algorithm    = 0;  // 0 = XOR (V1 default), 1 = AES-128-CTR
+    uint8_t  integrity_algorithm = 0;  // 0 = CRC32 (V1 default), 1 = HMAC-SHA256
 };
 
 // ============================================================

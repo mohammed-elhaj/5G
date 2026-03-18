@@ -42,4 +42,10 @@ private:
 
     /// Compute a 4-byte MAC-I using CRC32 over (integrity_key + count + data).
     uint32_t compute_mac_i(uint32_t count, const std::vector<uint8_t>& data);
+
+    // --- Member 1: AES-128-CTR cipher (NEA2 simplified) ---
+    void apply_cipher_aes_ctr(std::vector<uint8_t>& data, uint32_t count);
+
+    // --- Member 1: HMAC-SHA256 integrity ---
+    uint32_t compute_mac_i_hmac(uint32_t count, const std::vector<uint8_t>& data);
 };
