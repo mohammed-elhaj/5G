@@ -496,6 +496,46 @@ static void profile_variants() {
                       << std::setw(10) << (all_pass3 ? "PASS" : "FAIL")
                       << std::endl;
         }
+
+        // ---------- BSR-On: single LCID + BSR CE enabled (Member 6) ----------
+        {
+            Config cfg4;
+            cfg4.transport_block_size = (pkt_size + 3 > 2048) ? pkt_size + 64 : 2048;
+            cfg4.bsr_enabled          = true;
+            MacLayer mac4(cfg4);
+
+            ByteBuffer input4 = make_test_sdu(pkt_size, 0xAB);
+
+            double total_tx4 = 0.0, total_rx4 = 0.0;
+            bool all_pass4 = true;
+
+            for (int i = 0; i < ITERATIONS; i++) {
+                auto t0 = std::chrono::high_resolution_clock::now();
+                ByteBuffer tb = mac4.process_tx({input4});
+                auto t1 = std::chrono::high_resolution_clock::now();
+                auto sdus = mac4.process_rx(tb);
+                auto t2 = std::chrono::high_resolution_clock::now();
+
+                total_tx4 += std::chrono::duration<double, std::micro>(t1 - t0).count();
+                total_rx4 += std::chrono::duration<double, std::micro>(t2 - t1).count();
+
+                if (i == 0 && (sdus.empty() || !buffers_equal(sdus[0], input4)))
+                    all_pass4 = false;
+            }
+
+            // Overhead = 2B BSR (subheader+payload) + SDU subheader (2 or 3B)
+            size_t overhead4 = 2 + ((pkt_size > 255) ? 3 : 2);
+
+            std::cout << std::left
+                      << std::setw(12) << pkt_size
+                      << std::setw(16) << "BSR-On"
+                      << std::setw(14) << std::fixed << std::setprecision(2)
+                      << (total_tx4 / ITERATIONS)
+                      << std::setw(14) << (total_rx4 / ITERATIONS)
+                      << std::setw(14) << overhead4
+                      << std::setw(10) << (all_pass4 ? "PASS" : "FAIL")
+                      << std::endl;
+        }
     }
     std::cout << std::endl;
 }
@@ -504,41 +544,111 @@ static void profile_variants() {
 
 
 
-// AI-assisted: Member 6 - Unit test for BSR and Variable TB Truncation
-void test_member6_features() {
+// ---- Test: BSR MAC CE present in PDU when bsr_enabled=true ----
+// Added by Member 6 (integrated into test framework by Member 5)
+static void test_bsr_in_pdu() {
+    TEST("BSR CE (LCID=61) present in TB when bsr_enabled=true");
+
+    Config cfg;
+    cfg.transport_block_size = 512;
+    cfg.bsr_enabled          = true;
+    MacLayer mac(cfg);
+
+    ByteBuffer sdu = make_test_sdu(50, 0xAA);
+    ByteBuffer tb  = mac.process_tx({sdu});
+
+    // With BSR on: byte 0 must be LCID=61 (BSR subheader)
+    if ((tb.data[0] & 0x3F) != 61) {
+        FAIL("Expected LCID=61 at byte 0, got " + std::to_string(tb.data[0] & 0x3F));
+        return;
+    }
+
+    // SDU must still round-trip correctly after BSR
+    auto recovered = mac.process_rx(tb);
+    if (recovered.size() != 1 || !buffers_equal(sdu, recovered[0])) {
+        FAIL("SDU round-trip failed with BSR enabled");
+        return;
+    }
+
+    PASS();
+}
+
+// ---- Test: variable TB size — SDU fits in small TB ----
+// Added by Member 6 (integrated into test framework by Member 5)
+static void test_variable_tb_size() {
+    TEST("Variable TB size override (process_tx with tb_size=200)");
+
     Config cfg;
     MacLayer mac(cfg);
-    
-    std::vector<ByteBuffer> sdus(1);
-    sdus[0].data.resize(100, 0xAA);
 
-    size_t custom_tb = 50;
-    auto tb = mac.process_tx(sdus, custom_tb);
+    ByteBuffer sdu = make_test_sdu(100, 0xBB);
+    ByteBuffer tb  = mac.process_tx({sdu}, 200);  // override TB to 200 bytes
 
-    assert(tb.data.size() == 50); 
-    assert(tb.data[0] == 61);     
-    
-    std::cout << "  PASS: test_member6_features (BSR & Truncation)" << std::endl;
+    if (tb.size() != 200) {
+        FAIL("Expected TB size 200, got " + std::to_string(tb.size()));
+        return;
+    }
+
+    auto recovered = mac.process_rx(tb);
+    if (recovered.size() != 1 || !buffers_equal(sdu, recovered[0])) {
+        FAIL("SDU round-trip failed with variable TB size");
+        return;
+    }
+
+    PASS();
+}
+
+// ---- Test: truncation when TB is too small to fit even the first SDU ----
+// Added by Member 6 (integrated into test framework by Member 5)
+static void test_tb_too_small_truncation() {
+    TEST("Truncation: TB too small for SDU (tb_size=10, SDU=100B)");
+
+    Config cfg;
+    MacLayer mac(cfg);
+
+    ByteBuffer sdu = make_test_sdu(100, 0xCC);
+    ByteBuffer tb  = mac.process_tx({sdu}, 10);  // too small to fit SDU
+
+    // TB must be exactly 10 bytes
+    if (tb.size() != 10) {
+        FAIL("Expected TB size 10, got " + std::to_string(tb.size()));
+        return;
+    }
+
+    // No SDU should be recoverable — TB has only padding
+    auto recovered = mac.process_rx(tb);
+    if (!recovered.empty()) {
+        FAIL("Expected 0 SDUs from truncated TB, got " + std::to_string(recovered.size()));
+        return;
+    }
+
+    PASS();
 }
 int main() {
     std::cout << "==============================\n";
     std::cout << " MAC Layer Unit Tests\n";
     std::cout << "==============================\n";
 
+    // Original V1 tests — never modified
     test_single_small_sdu();
     test_single_large_sdu();
     test_multiple_sdus();
     test_mixed_sizes();
     test_padding();
 
-    // New tests — multi-LCID and LCP
+    // Member 5 — multi-LCID and LCP functional tests
     test_multi_lcid_mux_demux();
     test_lcp_priority_ordering();
     test_lcp_pbr_quota();
 
+    // Member 6 — BSR and variable TB tests
+    test_bsr_in_pdu();
+    test_variable_tb_size();
+    test_tb_too_small_truncation();
+
     std::cout << "\n  " << tests_passed << " / " << tests_run << " tests passed\n";
 
     profile_variants();
-test_member6_features();
+
     return (tests_passed == tests_run) ? 0 : 1;
 }
