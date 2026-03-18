@@ -325,6 +325,78 @@ static void test_lcp_pbr_quota() {
     PASS();
 }
 
+// ---- Test: LCP round-robin cycles fairly across 3 channels ----
+static void test_lcp_3channel_roundrobin() {
+    TEST("LCP round-robin cycles across 3 channels (LCID 4/5/6, pbr=60B, 4 SDUs each)");
+
+    Config cfg;
+    cfg.transport_block_size = 2048;
+    cfg.lcp_enabled          = true;
+    MacLayer mac(cfg);
+
+    // 3 channels, each with pbr=60B and 4 x 30B SDUs (total 120B per channel)
+    // PBR phase sends 2 SDUs per channel (2 x 30B = 60B = quota).
+    // Round-robin phase cycles remaining 2 SDUs per channel across all 3.
+    LcData ch4; ch4.lcid = 4; ch4.priority = 1; ch4.pbr_bytes = 60;
+    LcData ch5; ch5.lcid = 5; ch5.priority = 2; ch5.pbr_bytes = 60;
+    LcData ch6; ch6.lcid = 6; ch6.priority = 3; ch6.pbr_bytes = 60;
+
+    for (int i = 0; i < 4; i++) {
+        ch4.sdus.push_back(make_test_sdu(30, static_cast<uint8_t>(0x10 + i)));
+        ch5.sdus.push_back(make_test_sdu(30, static_cast<uint8_t>(0x20 + i)));
+        ch6.sdus.push_back(make_test_sdu(30, static_cast<uint8_t>(0x30 + i)));
+    }
+
+    ByteBuffer tb  = mac.process_tx({ch4, ch5, ch6});
+    auto       out = mac.process_rx_multi(tb);
+
+    if (out.size() != 12) {
+        FAIL("Expected 12 SDUs, got " + std::to_string(out.size()));
+        return;
+    }
+
+    // PBR phase: positions 0-1 = ch4, 2-3 = ch5, 4-5 = ch6
+    const uint8_t pbr_expected[6] = {4, 4, 5, 5, 6, 6};
+    for (int i = 0; i < 6; i++) {
+        if (out[i].first != pbr_expected[i]) {
+            FAIL("PBR phase: pos " + std::to_string(i) +
+                 " expected LCID=" + std::to_string(pbr_expected[i]) +
+                 " got LCID=" + std::to_string(out[i].first));
+            return;
+        }
+    }
+
+    // Round-robin phase: positions 6-11 cycle 4,5,6,4,5,6
+    const uint8_t rr_expected[6] = {4, 5, 6, 4, 5, 6};
+    for (int i = 0; i < 6; i++) {
+        if (out[6 + i].first != rr_expected[i]) {
+            FAIL("RR phase: pos " + std::to_string(6 + i) +
+                 " expected LCID=" + std::to_string(rr_expected[i]) +
+                 " got LCID=" + std::to_string(out[6 + i].first));
+            return;
+        }
+    }
+
+    // Verify payload round-trip: expected order after PBR + RR phases
+    // pos: 0=ch4[0], 1=ch4[1], 2=ch5[0], 3=ch5[1], 4=ch6[0], 5=ch6[1],
+    //      6=ch4[2], 7=ch5[2], 8=ch6[2], 9=ch4[3], 10=ch5[3], 11=ch6[3]
+    const ByteBuffer* expected[12] = {
+        &ch4.sdus[0], &ch4.sdus[1],
+        &ch5.sdus[0], &ch5.sdus[1],
+        &ch6.sdus[0], &ch6.sdus[1],
+        &ch4.sdus[2], &ch5.sdus[2], &ch6.sdus[2],
+        &ch4.sdus[3], &ch5.sdus[3], &ch6.sdus[3],
+    };
+    for (int i = 0; i < 12; i++) {
+        if (!buffers_equal(out[i].second, *expected[i])) {
+            FAIL("Payload mismatch at position " + std::to_string(i));
+            return;
+        }
+    }
+
+    PASS();
+}
+
 // ============================================================
 // profile_variants() — MAC Layer independent profiling
 // Follows testing_and_profiling_guide.md §3 template exactly.
@@ -640,6 +712,7 @@ int main() {
     test_multi_lcid_mux_demux();
     test_lcp_priority_ordering();
     test_lcp_pbr_quota();
+    test_lcp_3channel_roundrobin();
 
     // Member 6 — BSR and variable TB tests
     test_bsr_in_pdu();
