@@ -1,0 +1,98 @@
+#IncludeRegexLine: ^[ 	]*[#%][ 	]*(include|import)[ 	]*[<"]([^">]+)([">])
+
+#IncludeRegexScan: ^.*$
+
+#IncludeRegexComplain: ^$
+
+#IncludeRegexTransform: 
+
+../include/common.h
+cstdint
+-
+vector
+-
+string
+-
+chrono
+-
+
+../include/ip_generator.h
+common.h
+../include/common.h
+
+../include/mac.h
+common.h
+../include/common.h
+vector
+-
+
+../include/pdcp.h
+common.h
+../include/common.h
+vector
+-
+
+../include/rlc.h
+common.h
+../include/common.h
+vector
+-
+unordered_map
+-
+
+/home/muhammed/Desktop/Telecommunication Project/projects/5g-layer2/src/ip_generator.cpp
+ip_generator.h
+/home/muhammed/Desktop/Telecommunication Project/projects/5g-layer2/src/ip_generator.h
+iostream
+-
+
+/home/muhammed/Desktop/Telecommunication Project/projects/5g-layer2/src/mac.cpp
+mac.h
+/home/muhammed/Desktop/Telecommunication Project/projects/5g-layer2/src/mac.h
+cstring
+-
+iostream
+-
+
+/home/muhammed/Desktop/Telecommunication Project/projects/5g-layer2/src/pdcp.cpp
+pdcp.h
+/home/muhammed/Desktop/Telecommunication Project/projects/5g-layer2/src/pdcp.h
+iostream
+-
+cstring
+-
+stdexcept
+-
+openssl/evp.h
+-
+openssl/hmac.h
+-
+openssl/err.h
+-
+
+/home/muhammed/Desktop/Telecommunication Project/projects/5g-layer2/src/rlc.cpp
+rlc.h
+/home/muhammed/Desktop/Telecommunication Project/projects/5g-layer2/src/rlc.h
+algorithm
+-
+cstring
+-
+iostream
+-
+
+/home/muhammed/Desktop/Telecommunication Project/projects/5g-layer2/tests/test_integration.cpp
+common.h
+/home/muhammed/Desktop/Telecommunication Project/projects/5g-layer2/tests/common.h
+ip_generator.h
+/home/muhammed/Desktop/Telecommunication Project/projects/5g-layer2/tests/ip_generator.h
+pdcp.h
+/home/muhammed/Desktop/Telecommunication Project/projects/5g-layer2/tests/pdcp.h
+rlc.h
+/home/muhammed/Desktop/Telecommunication Project/projects/5g-layer2/tests/rlc.h
+mac.h
+/home/muhammed/Desktop/Telecommunication Project/projects/5g-layer2/tests/mac.h
+iostream
+-
+string
+-
+

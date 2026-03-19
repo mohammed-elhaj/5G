@@ -82,5 +82,6 @@ private:
     // ========================================================
     std::vector<uint8_t> compress_header(const std::vector<uint8_t>& data);
     std::vector<uint8_t> decompress_header(const std::vector<uint8_t>& data);
-
+    std::vector<uint8_t> stored_ip_header_;
+    bool context_initialized_ = false;
 };
