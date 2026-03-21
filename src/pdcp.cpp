@@ -58,14 +58,8 @@ PdcpLayer::PdcpLayer(const Config& cfg) : config_(cfg) {}
 void PdcpLayer::reset() {
     tx_next_ = 0;
     rx_next_ = 0;
-
-    comp_tx_id_ = 0;
-    comp_rx_id_ = 0;
-    prev_tx_len_ = 0;
-    prev_rx_len_ = 0;
-
-    context_initialized_ = false;
-    stored_ip_header_.clear();
+    tx_comp_ctx_ = CompressionContext{};
+    rx_comp_ctx_ = CompressionContext{};
 }
 
 // ============================================================
@@ -158,63 +152,77 @@ void PdcpLayer::apply_cipher_aes_ctr(std::vector<uint8_t>& data, uint32_t count)
 }
 
 // ============================================================
-// Member 2: Header Compression (FINAL VERSION)
+// Simplified ROHC-style header compression (Member 2)
 //
-// Strategy:
-//   - First IPv4 packet is sent UNCOMPRESSED to establish context
-//   - Its full 20-byte header is stored
-//   - Subsequent packets:
-//       Replace IPv4 header (20B) with:
-//         [0xFC][packet_id(2B)][total_length(2B)]
+// Per TS 38.323 §5.6, PDCP supports header compression using
+// ROHC (RFC 5795). Our simplified implementation:
+//   - First packet: store static IPv4 fields as context, send uncompressed
+//   - Subsequent packets: replace 20-byte IPv4 header with 7-byte
+//     compressed header (marker + dynamic fields only)
 //
-// Result:
-//   20B → 5B (safe, no truncation issues)
+// Compressed format:
+//   Byte 0:   0xFC (marker — invalid as IPv4 version/IHL, so unambiguous)
+//   Byte 1-2: Total Length (from original IPv4 bytes 2-3)
+//   Byte 3-4: Identification (from original IPv4 bytes 4-5)
+//   Byte 5-6: Header Checksum (from original IPv4 bytes 10-11)
+//   Byte 7+:  Original payload (everything after the 20-byte IP header)
 //
-// Only applies to IPv4 packets (Version = 4)
+// Saves 13 bytes per packet (20 - 7 = 13) after context is established.
+// AI-assisted: reviewed by Member 1
 // ============================================================
 std::vector<uint8_t> PdcpLayer::compress_header(const std::vector<uint8_t>& data) {
+    // Need at least a 20-byte IPv4 header to compress
+    if (data.size() < IPV4_HEADER_SIZE) return data;
 
-    // --- Ensure packet is large enough ---
-    if (data.size() < 20) return data;
+    // Only compress IPv4 packets (version=4, IHL=5 → first byte = 0x45)
+    if (data[0] != 0x45) return data;
 
-    // --- Check IPv4 version ---
-    if ((data[0] >> 4) != 4) return data;
+    if (!tx_comp_ctx_.context_established) {
+        // First packet: establish context by storing static fields
+        tx_comp_ctx_.version_ihl    = data[0];
+        tx_comp_ctx_.dscp_ecn       = data[1];
+        tx_comp_ctx_.flags_fragment = (static_cast<uint16_t>(data[6]) << 8) | data[7];
+        tx_comp_ctx_.ttl            = data[8];
+        tx_comp_ctx_.protocol       = data[9];
+        tx_comp_ctx_.src_ip         = (static_cast<uint32_t>(data[12]) << 24) |
+                                      (static_cast<uint32_t>(data[13]) << 16) |
+                                      (static_cast<uint32_t>(data[14]) << 8)  |
+                                      static_cast<uint32_t>(data[15]);
+        tx_comp_ctx_.dst_ip         = (static_cast<uint32_t>(data[16]) << 24) |
+                                      (static_cast<uint32_t>(data[17]) << 16) |
+                                      (static_cast<uint32_t>(data[18]) << 8)  |
+                                      static_cast<uint32_t>(data[19]);
+        tx_comp_ctx_.context_established = true;
 
-    // ========================================================
-    // First packet: establish compression context
-    // ========================================================
-    if (!context_initialized_) {
-        stored_ip_header_.assign(data.begin(), data.begin() + 20);
-        context_initialized_ = true;
-
-        // Send first packet uncompressed
+        // First packet is sent UNCOMPRESSED (like ROHC IR state)
         return data;
     }
 
-    // ========================================================
-    // Compress packet
-    // ========================================================
-    std::vector<uint8_t> out;
+    // Subsequent packets: compress by replacing 20-byte header with 7-byte compressed header
+    // Extract dynamic fields from the original IPv4 header
+    uint8_t total_len_hi = data[2];
+    uint8_t total_len_lo = data[3];
+    uint8_t ident_hi     = data[4];
+    uint8_t ident_lo     = data[5];
+    uint8_t checksum_hi  = data[10];
+    uint8_t checksum_lo  = data[11];
 
-    // --- Marker ---
-    out.push_back(0xFC);
+    // Build compressed packet: [marker(1) | total_len(2) | ident(2) | checksum(2) | payload]
+    std::vector<uint8_t> compressed;
+    compressed.reserve(COMPRESSED_HEADER_SIZE + (data.size() - IPV4_HEADER_SIZE));
 
-    // --- Packet ID (2 bytes) ---
-    out.push_back((comp_tx_id_ >> 8) & 0xFF);
-    out.push_back(comp_tx_id_ & 0xFF);
+    compressed.push_back(COMPRESSED_MARKER);
+    compressed.push_back(total_len_hi);
+    compressed.push_back(total_len_lo);
+    compressed.push_back(ident_hi);
+    compressed.push_back(ident_lo);
+    compressed.push_back(checksum_hi);
+    compressed.push_back(checksum_lo);
 
-    // --- Total length (2 bytes, NO truncation) ---
-    uint16_t total_len = static_cast<uint16_t>(data.size());
-    out.push_back((total_len >> 8) & 0xFF);
-    out.push_back(total_len & 0xFF);
+    // Append the original payload (everything after the 20-byte IP header)
+    compressed.insert(compressed.end(), data.begin() + IPV4_HEADER_SIZE, data.end());
 
-    // --- Append payload (skip 20-byte IP header) ---
-    out.insert(out.end(), data.begin() + 20, data.end());
-
-    // --- Update state ---
-    comp_tx_id_++;
-
-    return out;
+    return compressed;
 }
 // ============================================================
 // Compute MAC-I — CRC32 over (integrity_key || count || data).
@@ -292,74 +300,95 @@ uint32_t PdcpLayer::compute_mac_i_hmac(uint32_t count, const std::vector<uint8_t
 }
 
 // ============================================================
-// Member 2: Header Decompression (FINAL VERSION)
-//
-// Strategy:
-//   - If marker (0xFC) not present → packet is uncompressed
-//     → use it to initialize context if needed
-//
-//   - If compressed:
-//       Restore full 20-byte header using stored context
-//       Update total length field
-//       Append payload
-//
-// Guarantees:
-//   - Lossless reconstruction of original IPv4 packet
+// Decompress: restore full 20-byte IPv4 header from compressed
+// 7-byte header + stored context.
+// AI-assisted: reviewed by Member 1
 // ============================================================
 std::vector<uint8_t> PdcpLayer::decompress_header(const std::vector<uint8_t>& data) {
+    if (data.empty()) return data;
 
-    // ========================================================
-    // Case 1: Not compressed → pass through
-    // ========================================================
-    if (data.size() < 1 || data[0] != 0xFC) {
-
-        // If this is an IPv4 packet, initialize context
-        if (data.size() >= 20 && (data[0] >> 4) == 4 && !context_initialized_) {
-            stored_ip_header_.assign(data.begin(), data.begin() + 20);
-            context_initialized_ = true;
+    // Check if this is a compressed packet (starts with our marker)
+    if (data[0] != COMPRESSED_MARKER) {
+        // Uncompressed packet — establish decompressor context from it
+        if (data.size() >= IPV4_HEADER_SIZE && data[0] == 0x45) {
+            rx_comp_ctx_.version_ihl    = data[0];
+            rx_comp_ctx_.dscp_ecn       = data[1];
+            rx_comp_ctx_.flags_fragment = (static_cast<uint16_t>(data[6]) << 8) | data[7];
+            rx_comp_ctx_.ttl            = data[8];
+            rx_comp_ctx_.protocol       = data[9];
+            rx_comp_ctx_.src_ip         = (static_cast<uint32_t>(data[12]) << 24) |
+                                          (static_cast<uint32_t>(data[13]) << 16) |
+                                          (static_cast<uint32_t>(data[14]) << 8)  |
+                                          static_cast<uint32_t>(data[15]);
+            rx_comp_ctx_.dst_ip         = (static_cast<uint32_t>(data[16]) << 24) |
+                                          (static_cast<uint32_t>(data[17]) << 16) |
+                                          (static_cast<uint32_t>(data[18]) << 8)  |
+                                          static_cast<uint32_t>(data[19]);
+            rx_comp_ctx_.context_established = true;
         }
-
-        return data;
+        return data;  // Already uncompressed, pass through
     }
 
-    // ========================================================
-    // Case 2: Compressed packet
-    // ========================================================
-    if (!context_initialized_) {
-        // Cannot decompress without context
-        return {}; // fail safely
+    // This is a compressed packet — need context to decompress
+    if (!rx_comp_ctx_.context_established) {
+        std::cerr << "[PDCP RX] Cannot decompress: no context established\n";
+        return {};
     }
 
-    size_t offset = 1;
+    if (data.size() < COMPRESSED_HEADER_SIZE) {
+        std::cerr << "[PDCP RX] Compressed packet too short\n";
+        return {};
+    }
 
-    // --- Packet ID (not strictly needed for reconstruction) ---
-    uint16_t pkt_id = (data[offset] << 8) | data[offset + 1];
-    offset += 2;
+    // Extract dynamic fields from compressed header
+    uint8_t total_len_hi = data[1];
+    uint8_t total_len_lo = data[2];
+    uint8_t ident_hi     = data[3];
+    uint8_t ident_lo     = data[4];
+    uint8_t checksum_hi  = data[5];
+    uint8_t checksum_lo  = data[6];
 
-    // --- Total length ---
-    uint16_t total_len = (data[offset] << 8) | data[offset + 1];
-    offset += 2;
+    // Reconstruct the full 20-byte IPv4 header from context + dynamic fields
+    std::vector<uint8_t> decompressed;
+    decompressed.reserve(IPV4_HEADER_SIZE + (data.size() - COMPRESSED_HEADER_SIZE));
 
-    std::vector<uint8_t> out;
+    // Byte 0: Version + IHL (from context)
+    decompressed.push_back(rx_comp_ctx_.version_ihl);
+    // Byte 1: DSCP + ECN (from context)
+    decompressed.push_back(rx_comp_ctx_.dscp_ecn);
+    // Byte 2-3: Total Length (dynamic)
+    decompressed.push_back(total_len_hi);
+    decompressed.push_back(total_len_lo);
+    // Byte 4-5: Identification (dynamic)
+    decompressed.push_back(ident_hi);
+    decompressed.push_back(ident_lo);
+    // Byte 6-7: Flags + Fragment Offset (from context)
+    decompressed.push_back(static_cast<uint8_t>((rx_comp_ctx_.flags_fragment >> 8) & 0xFF));
+    decompressed.push_back(static_cast<uint8_t>(rx_comp_ctx_.flags_fragment & 0xFF));
+    // Byte 8: TTL (from context)
+    decompressed.push_back(rx_comp_ctx_.ttl);
+    // Byte 9: Protocol (from context)
+    decompressed.push_back(rx_comp_ctx_.protocol);
+    // Byte 10-11: Header Checksum (dynamic)
+    decompressed.push_back(checksum_hi);
+    decompressed.push_back(checksum_lo);
+    // Byte 12-15: Source IP (from context)
+    decompressed.push_back(static_cast<uint8_t>((rx_comp_ctx_.src_ip >> 24) & 0xFF));
+    decompressed.push_back(static_cast<uint8_t>((rx_comp_ctx_.src_ip >> 16) & 0xFF));
+    decompressed.push_back(static_cast<uint8_t>((rx_comp_ctx_.src_ip >> 8) & 0xFF));
+    decompressed.push_back(static_cast<uint8_t>(rx_comp_ctx_.src_ip & 0xFF));
+    // Byte 16-19: Destination IP (from context)
+    decompressed.push_back(static_cast<uint8_t>((rx_comp_ctx_.dst_ip >> 24) & 0xFF));
+    decompressed.push_back(static_cast<uint8_t>((rx_comp_ctx_.dst_ip >> 16) & 0xFF));
+    decompressed.push_back(static_cast<uint8_t>((rx_comp_ctx_.dst_ip >> 8) & 0xFF));
+    decompressed.push_back(static_cast<uint8_t>(rx_comp_ctx_.dst_ip & 0xFF));
 
-    // ========================================================
-    // Restore full IPv4 header from stored context
-    // ========================================================
-    out.insert(out.end(), stored_ip_header_.begin(), stored_ip_header_.end());
+    // Append the payload data (everything after the 7-byte compressed header)
+    decompressed.insert(decompressed.end(),
+                        data.begin() + COMPRESSED_HEADER_SIZE,
+                        data.end());
 
-    // --- Update total length field (bytes 2–3) ---
-    out[2] = (total_len >> 8) & 0xFF;
-    out[3] = total_len & 0xFF;
-
-    // ========================================================
-    // Append payload
-    // ========================================================
-    out.insert(out.end(), data.begin() + offset, data.end());
-
-    // --- Update RX state ---
-    comp_rx_id_++;
-
-    return out;
+    return decompressed;
 }
 // ============================================================
 // TX path (uplink): SDU (IP packet) → PDCP PDU

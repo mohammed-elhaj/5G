@@ -41,18 +41,29 @@ private:
     Config   config_;
 
     // ========================================================
-    // Member 2: Compression state
+    // Member 2: Simplified ROHC-style header compression
     //
-    // These variables maintain context required for
-    // ROHC-style delta compression.
+    // Stores static IPv4 fields (src/dst IP, protocol, TTL, etc.)
+    // from the first packet. Subsequent packets carry only the
+    // dynamic fields (Total Length, Identification, Checksum).
     // ========================================================
-    uint16_t comp_tx_id_ = 0;   // Packet ID for TX compressed packets
-    uint16_t comp_rx_id_ = 0;   // Packet ID for RX (for tracking/debugging)
+    struct CompressionContext {
+        bool     context_established = false;
+        uint8_t  version_ihl    = 0;     // IPv4 byte 0
+        uint8_t  dscp_ecn       = 0;     // IPv4 byte 1
+        uint16_t flags_fragment = 0;     // IPv4 bytes 6-7
+        uint8_t  ttl            = 0;     // IPv4 byte 8
+        uint8_t  protocol       = 0;     // IPv4 byte 9
+        uint32_t src_ip         = 0;     // IPv4 bytes 12-15
+        uint32_t dst_ip         = 0;     // IPv4 bytes 16-19
+    };
 
-    uint8_t prev_tx_len_ = 0;   // Previous TX packet length (for delta encoding)
-    uint8_t prev_rx_len_ = 0;   // Previous RX packet length
+    CompressionContext tx_comp_ctx_;   // Compressor context (TX side)
+    CompressionContext rx_comp_ctx_;   // Decompressor context (RX side)
 
-    // ========================================================
+    static constexpr uint8_t COMPRESSED_MARKER = 0xFC;
+    static constexpr size_t  IPV4_HEADER_SIZE  = 20;
+    static constexpr size_t  COMPRESSED_HEADER_SIZE = 7;  // 1 marker + 2 length + 2 id + 2 checksum
 
 
     /// Generate a pseudo-keystream of the given length from (cipher_key, count).
@@ -75,13 +86,12 @@ private:
     // Member 2: Header compression functions
     //
     // compress_header:
-    //   - Replaces 20-byte IPv4 header with 4-byte compact header
+    //   - Replaces 20-byte IPv4 header with 7-byte compressed header
+    //     [0xFC marker][Total Length(2B)][Identification(2B)][Checksum(2B)]
     //
     // decompress_header:
-    //   - Restores original IPv4 header using stored context
+    //   - Restores full 20-byte IPv4 header from context + dynamic fields
     // ========================================================
     std::vector<uint8_t> compress_header(const std::vector<uint8_t>& data);
     std::vector<uint8_t> decompress_header(const std::vector<uint8_t>& data);
-    std::vector<uint8_t> stored_ip_header_;
-    bool context_initialized_ = false;
 };

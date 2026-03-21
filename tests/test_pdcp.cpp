@@ -466,37 +466,37 @@ static void test_aes_hmac_sequential() {
 
 
 // ============================================================
-// Member 2: Generate a valid IPv4 packet
+// Member 2: Generate a valid IPv4 packet for compression testing
 // ============================================================
-static ByteBuffer make_ipv4_packet(size_t payload_size) {
+static ByteBuffer make_ipv4_packet(size_t total_size, uint16_t identification = 0x0001) {
     ByteBuffer pkt;
-    pkt.data.resize(20 + payload_size);
+    pkt.data.resize(total_size);
 
-    // IPv4 header
-    pkt.data[0] = 0x45; // Version=4, IHL=5
-    pkt.data[1] = 0x00;
+    // IPv4 header (20 bytes)
+    pkt.data[0] = 0x45;  // Version=4, IHL=5
+    pkt.data[1] = 0x00;  // DSCP + ECN
+    pkt.data[2] = static_cast<uint8_t>((total_size >> 8) & 0xFF);  // Total Length hi
+    pkt.data[3] = static_cast<uint8_t>(total_size & 0xFF);          // Total Length lo
+    pkt.data[4] = static_cast<uint8_t>((identification >> 8) & 0xFF);  // Identification hi
+    pkt.data[5] = static_cast<uint8_t>(identification & 0xFF);          // Identification lo
+    pkt.data[6] = 0x40;  // Flags: Don't Fragment
+    pkt.data[7] = 0x00;  // Fragment Offset
+    pkt.data[8] = 0x40;  // TTL = 64
+    pkt.data[9] = 0x11;  // Protocol = UDP (17)
+    pkt.data[10] = 0x00; // Header Checksum hi
+    pkt.data[11] = 0x00; // Header Checksum lo
+    pkt.data[12] = 10;   // Src IP: 10.0.0.1
+    pkt.data[13] = 0;
+    pkt.data[14] = 0;
+    pkt.data[15] = 1;
+    pkt.data[16] = 10;   // Dst IP: 10.0.0.2
+    pkt.data[17] = 0;
+    pkt.data[18] = 0;
+    pkt.data[19] = 2;
 
-    uint16_t total_len = 20 + payload_size;
-    pkt.data[2] = (total_len >> 8) & 0xFF;
-    pkt.data[3] = total_len & 0xFF;
-
-    pkt.data[4] = 0x00; pkt.data[5] = 0x01;
-    pkt.data[6] = 0x00; pkt.data[7] = 0x00;
-
-    pkt.data[8] = 64;   // TTL
-    pkt.data[9] = 17;   // UDP
-
-    // Src IP
-    pkt.data[12] = 192; pkt.data[13] = 168;
-    pkt.data[14] = 1;   pkt.data[15] = 1;
-
-    // Dst IP
-    pkt.data[16] = 192; pkt.data[17] = 168;
-    pkt.data[18] = 1;   pkt.data[19] = 2;
-
-    // Payload
-    for (size_t i = 20; i < pkt.data.size(); i++) {
-        pkt.data[i] = static_cast<uint8_t>(i & 0xFF);
+    // Fill payload after IP header with recognizable pattern
+    for (size_t i = 20; i < total_size; i++) {
+        pkt.data[i] = static_cast<uint8_t>((identification + i) & 0xFF);
     }
 
     return pkt;
@@ -510,40 +510,26 @@ static ByteBuffer make_ipv4_packet(size_t payload_size) {
 //   results in original SDU
 // ============================================================
 static void test_compression_roundtrip() {
-    TEST("Compression round-trip (IPv4)");
+    TEST("Compression round-trip (10 packets)");
 
     Config cfg;
-    cfg.pdcp_sn_length = 12;
-    cfg.ciphering_enabled = true;
-    cfg.integrity_enabled = true;
     cfg.compression_enabled = true;
+    cfg.ciphering_enabled   = true;
+    cfg.integrity_enabled   = true;
 
-    PdcpLayer tx(cfg);
-    PdcpLayer rx(cfg);
+    PdcpLayer pdcp_tx(cfg);
+    PdcpLayer pdcp_rx(cfg);
 
-    // First packet → establishes context
-    ByteBuffer sdu1 = make_ipv4_packet(100);
-    ByteBuffer pdu1 = tx.process_tx(sdu1);
-    ByteBuffer rec1 = rx.process_rx(pdu1);
+    for (int i = 0; i < 10; i++) {
+        ByteBuffer sdu = make_ipv4_packet(500, static_cast<uint16_t>(i + 1));
+        ByteBuffer pdu = pdcp_tx.process_tx(sdu);
+        ByteBuffer recovered = pdcp_rx.process_rx(pdu);
 
-    // Second packet → should be compressed
-    ByteBuffer sdu2 = make_ipv4_packet(120);
-    ByteBuffer pdu2 = tx.process_tx(sdu2);
-
-    // 🔥 Verify compression marker exists
-    size_t header_size = 2;
-    if (pdu2.data[header_size] != 0xFC) {
-        FAIL("Compression not applied");
-        return;
+        if (!buffers_equal(sdu, recovered)) {
+            FAIL("Mismatch on packet " + std::to_string(i));
+            return;
+        }
     }
-
-    ByteBuffer rec2 = rx.process_rx(pdu2);
-
-    if (!buffers_equal(sdu2, rec2)) {
-        FAIL("Roundtrip mismatch after compression");
-        return;
-    }
-
     PASS();
 }
 
@@ -555,34 +541,33 @@ static void test_compression_roundtrip() {
 //   compressed PDU < original SDU
 // ============================================================
 static void test_compression_reduces_size() {
-    TEST("Compression reduces payload size");
+    TEST("Second packet is smaller (13 bytes saved)");
 
     Config cfg;
-    cfg.pdcp_sn_length = 12;
-    cfg.ciphering_enabled = false;
-    cfg.integrity_enabled = false;
     cfg.compression_enabled = true;
+    cfg.ciphering_enabled   = false;
+    cfg.integrity_enabled   = false;
 
-    PdcpLayer pdcp(cfg);
+    PdcpLayer pdcp_tx(cfg);
 
-    // First packet (no compression)
-    ByteBuffer sdu1 = make_ipv4_packet(200);
-    ByteBuffer pdu1 = pdcp.process_tx(sdu1);
+    // First packet — establishes context, sent uncompressed
+    ByteBuffer sdu1 = make_ipv4_packet(200, 0x0001);
+    ByteBuffer pdu1 = pdcp_tx.process_tx(sdu1);
 
-    // Second packet (compressed)
-    ByteBuffer sdu2 = make_ipv4_packet(200);
-    ByteBuffer pdu2 = pdcp.process_tx(sdu2);
+    // Second packet — should be compressed (13 bytes smaller)
+    ByteBuffer sdu2 = make_ipv4_packet(200, 0x0002);
+    ByteBuffer pdu2 = pdcp_tx.process_tx(sdu2);
 
-    size_t header_size = 2;
-
-    size_t payload1 = pdu1.size() - header_size;
-    size_t payload2 = pdu2.size() - header_size;
-
-    if (payload2 >= payload1) {
-        FAIL("Compressed payload not smaller");
+    // Expected: pdu2 is 13 bytes smaller than pdu1
+    // pdu1 = 2 (PDCP header) + 200 (uncompressed) = 202
+    // pdu2 = 2 (PDCP header) + 187 (compressed: 200 - 13) = 189
+    size_t expected_saving = 13;  // 20-byte IP header → 7-byte compressed header
+    if (pdu1.size() - pdu2.size() != expected_saving) {
+        FAIL("Expected " + std::to_string(expected_saving) + " bytes saved, got " +
+             std::to_string(pdu1.size()) + " - " + std::to_string(pdu2.size()) + " = " +
+             std::to_string(pdu1.size() - pdu2.size()));
         return;
     }
-
     PASS();
 }
 
@@ -611,73 +596,206 @@ static void test_compression_disabled() {
     PASS();
 }
 
+// ---- Test: First packet is uncompressed (context establishment) ----
+static void test_compression_first_packet_uncompressed() {
+    TEST("First packet sent uncompressed (context establishment)");
+
+    Config cfg_comp;
+    cfg_comp.compression_enabled = true;
+    cfg_comp.ciphering_enabled   = false;
+    cfg_comp.integrity_enabled   = false;
+
+    Config cfg_nocomp;
+    cfg_nocomp.compression_enabled = false;
+    cfg_nocomp.ciphering_enabled   = false;
+    cfg_nocomp.integrity_enabled   = false;
+
+    PdcpLayer pdcp_comp(cfg_comp);
+    PdcpLayer pdcp_nocomp(cfg_nocomp);
+
+    ByteBuffer sdu = make_ipv4_packet(200, 0x0001);
+    ByteBuffer pdu_comp   = pdcp_comp.process_tx(sdu);
+    ByteBuffer pdu_nocomp = pdcp_nocomp.process_tx(sdu);
+
+    // First packet should be same size (uncompressed, context not yet established)
+    if (pdu_comp.size() != pdu_nocomp.size()) {
+        FAIL("First packet should be uncompressed but sizes differ: " +
+             std::to_string(pdu_comp.size()) + " vs " + std::to_string(pdu_nocomp.size()));
+        return;
+    }
+    PASS();
+}
+
+// ---- Test: Compression + AES-128-CTR + HMAC-SHA256 combined ----
+static void test_compression_with_aes_hmac() {
+    TEST("Compression + AES-128-CTR + HMAC-SHA256 combined");
+
+    Config cfg;
+    cfg.compression_enabled   = true;
+    cfg.ciphering_enabled     = true;
+    cfg.integrity_enabled     = true;
+    cfg.cipher_algorithm      = 1;  // AES-128-CTR
+    cfg.integrity_algorithm   = 1;  // HMAC-SHA256
+
+    PdcpLayer pdcp_tx(cfg);
+    PdcpLayer pdcp_rx(cfg);
+
+    for (int i = 0; i < 10; i++) {
+        ByteBuffer sdu = make_ipv4_packet(1400, static_cast<uint16_t>(i + 1));
+        ByteBuffer pdu = pdcp_tx.process_tx(sdu);
+        ByteBuffer recovered = pdcp_rx.process_rx(pdu);
+
+        if (!buffers_equal(sdu, recovered)) {
+            FAIL("Mismatch on packet " + std::to_string(i));
+            return;
+        }
+    }
+    PASS();
+}
+
+// ---- Test: Compression with 18-bit SN ----
+static void test_compression_18bit_sn() {
+    TEST("Compression with 18-bit SN");
+
+    Config cfg;
+    cfg.pdcp_sn_length        = 18;
+    cfg.compression_enabled   = true;
+    cfg.ciphering_enabled     = true;
+    cfg.integrity_enabled     = true;
+
+    PdcpLayer pdcp_tx(cfg);
+    PdcpLayer pdcp_rx(cfg);
+
+    for (int i = 0; i < 5; i++) {
+        ByteBuffer sdu = make_ipv4_packet(800, static_cast<uint16_t>(i + 100));
+        ByteBuffer pdu = pdcp_tx.process_tx(sdu);
+        ByteBuffer recovered = pdcp_rx.process_rx(pdu);
+
+        if (!buffers_equal(sdu, recovered)) {
+            FAIL("Mismatch on packet " + std::to_string(i));
+            return;
+        }
+    }
+    PASS();
+}
+
+// ---- Test: Non-IPv4 packet passes through compression unmodified ----
+static void test_compression_non_ipv4_passthrough() {
+    TEST("Non-IPv4 packet passes through unmodified");
+
+    Config cfg;
+    cfg.compression_enabled = true;
+    cfg.ciphering_enabled   = true;
+    cfg.integrity_enabled   = true;
+
+    PdcpLayer pdcp_tx(cfg);
+    PdcpLayer pdcp_rx(cfg);
+
+    // Create a packet that does NOT start with 0x45
+    ByteBuffer sdu = make_test_sdu(200, 0xBB);
+
+    ByteBuffer pdu = pdcp_tx.process_tx(sdu);
+    ByteBuffer recovered = pdcp_rx.process_rx(pdu);
+
+    if (!buffers_equal(sdu, recovered)) {
+        FAIL("Non-IPv4 packet round-trip failed");
+        return;
+    }
+    PASS();
+}
+
+// ---- Test: Large packet compression (9000 bytes) ----
+static void test_compression_large_packet() {
+    TEST("Compression with 9000-byte packet");
+
+    Config cfg;
+    cfg.compression_enabled = true;
+    cfg.ciphering_enabled   = true;
+    cfg.integrity_enabled   = true;
+
+    PdcpLayer pdcp_tx(cfg);
+    PdcpLayer pdcp_rx(cfg);
+
+    // First packet establishes context
+    ByteBuffer sdu1 = make_ipv4_packet(9000, 0x0001);
+    ByteBuffer pdu1 = pdcp_tx.process_tx(sdu1);
+    ByteBuffer rec1 = pdcp_rx.process_rx(pdu1);
+    if (!buffers_equal(sdu1, rec1)) { FAIL("First packet round-trip failed"); return; }
+
+    // Second packet uses compression
+    ByteBuffer sdu2 = make_ipv4_packet(9000, 0x0002);
+    ByteBuffer pdu2 = pdcp_tx.process_tx(sdu2);
+    ByteBuffer rec2 = pdcp_rx.process_rx(pdu2);
+    if (!buffers_equal(sdu2, rec2)) { FAIL("Second packet round-trip failed"); return; }
+
+    PASS();
+}
+
 static void profile_compression() {
     const int ITERATIONS = 1000;
-    const std::vector<uint32_t> pkt_sizes = {100, 500, 1000, 1400};
+    const std::vector<uint32_t> pkt_sizes = {100, 500, 1000, 1400, 3000, 9000};
 
     std::cout << "\n==========================================\n";
-    std::cout << "  PDCP Compression Profiling\n";
+    std::cout << "  PDCP Profiling: Compression\n";
     std::cout << "==========================================\n\n";
 
     std::cout << std::left
               << std::setw(10) << "PktSize"
-              << std::setw(18) << "Mode"
+              << std::setw(15) << "Compression"
               << std::setw(14) << "TX avg(us)"
               << std::setw(14) << "RX avg(us)"
-              << std::setw(16) << "Avg Size"
-              << std::setw(16) << "Reduction"
+              << std::setw(14) << "PDU Size"
+              << std::setw(14) << "Saved(B)"
               << std::endl;
+    std::cout << std::string(81, '-') << std::endl;
 
-    std::cout << std::string(80, '-') << std::endl;
+    for (uint32_t pkt_size : pkt_sizes) {
+        size_t nocomp_pdu_size = 0;
 
-    for (uint32_t size : pkt_sizes) {
         for (bool comp : {false, true}) {
-
             Config cfg;
-            cfg.pdcp_sn_length = 12;
-            cfg.ciphering_enabled = true;
-            cfg.integrity_enabled = true;
+            cfg.ciphering_enabled   = true;
+            cfg.integrity_enabled   = true;
             cfg.compression_enabled = comp;
 
-            PdcpLayer tx(cfg);
-            PdcpLayer rx(cfg);
+            PdcpLayer pdcp_tx(cfg);
+            PdcpLayer pdcp_rx(cfg);
+
+            // First packet to establish context (not measured)
+            if (comp) {
+                ByteBuffer setup = make_ipv4_packet(pkt_size, 0x0000);
+                auto setup_pdu = pdcp_tx.process_tx(setup);
+                pdcp_rx.process_rx(setup_pdu);
+            }
 
             double total_tx = 0, total_rx = 0;
-            double total_size = 0;
+            size_t pdu_size = 0;
 
             for (int i = 0; i < ITERATIONS; i++) {
-                tx.reset();
-                rx.reset();
-
-                ByteBuffer sdu = make_ipv4_packet(size);
+                ByteBuffer sdu = make_ipv4_packet(pkt_size, static_cast<uint16_t>(i + 1));
 
                 auto t0 = std::chrono::high_resolution_clock::now();
-                ByteBuffer pdu = tx.process_tx(sdu);
+                ByteBuffer pdu = pdcp_tx.process_tx(sdu);
                 auto t1 = std::chrono::high_resolution_clock::now();
-                ByteBuffer rec = rx.process_rx(pdu);
+                ByteBuffer rec = pdcp_rx.process_rx(pdu);
                 auto t2 = std::chrono::high_resolution_clock::now();
 
                 total_tx += std::chrono::duration<double, std::micro>(t1 - t0).count();
                 total_rx += std::chrono::duration<double, std::micro>(t2 - t1).count();
-
-                total_size += pdu.size();
+                if (i == 0) pdu_size = pdu.size();
             }
 
-            double avg_size = total_size / ITERATIONS;
-            double reduction = 0;
+            if (!comp) nocomp_pdu_size = pdu_size;
 
-            if (comp) {
-                // Compare against uncompressed size
-                reduction = (20.0 - 5.0); // header savings
-            }
+            int saved = comp ? static_cast<int>(nocomp_pdu_size) - static_cast<int>(pdu_size) : 0;
 
             std::cout << std::left
-                      << std::setw(10) << size
-                      << std::setw(18) << (comp ? "Compression ON" : "Compression OFF")
-                      << std::setw(14) << (total_tx / ITERATIONS)
+                      << std::setw(10) << pkt_size
+                      << std::setw(15) << (comp ? "ON" : "OFF")
+                      << std::setw(14) << std::fixed << std::setprecision(2) << (total_tx / ITERATIONS)
                       << std::setw(14) << (total_rx / ITERATIONS)
-                      << std::setw(16) << avg_size
-                      << std::setw(16) << reduction
+                      << std::setw(14) << pdu_size
+                      << std::setw(14) << (comp ? std::to_string(saved) : "-")
                       << std::endl;
         }
     }
@@ -818,8 +936,13 @@ int main() {
     // ============================================================
     std::cout << "\n  --- Compression Tests ---\n";
     test_compression_roundtrip();
+    test_compression_first_packet_uncompressed();
     test_compression_reduces_size();
     test_compression_disabled();
+    test_compression_with_aes_hmac();
+    test_compression_18bit_sn();
+    test_compression_non_ipv4_passthrough();
+    test_compression_large_packet();
     profile_compression();
     std::cout << "\n  " << tests_passed << " / " << tests_run << " tests passed\n";
     return (tests_passed == tests_run) ? 0 : 1;

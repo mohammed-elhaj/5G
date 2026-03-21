@@ -1,7 +1,0 @@
-/home/muhammed/Desktop/Telecommunication Project/projects/5g-layer2/build/CMakeFiles/test_mac.dir
-/home/muhammed/Desktop/Telecommunication Project/projects/5g-layer2/build/CMakeFiles/edit_cache.dir
-/home/muhammed/Desktop/Telecommunication Project/projects/5g-layer2/build/CMakeFiles/test_rlc.dir
-/home/muhammed/Desktop/Telecommunication Project/projects/5g-layer2/build/CMakeFiles/test_pdcp.dir
-/home/muhammed/Desktop/Telecommunication Project/projects/5g-layer2/build/CMakeFiles/rebuild_cache.dir
-/home/muhammed/Desktop/Telecommunication Project/projects/5g-layer2/build/CMakeFiles/test_integration.dir
-/home/muhammed/Desktop/Telecommunication Project/projects/5g-layer2/build/CMakeFiles/5g_layer2.dir
