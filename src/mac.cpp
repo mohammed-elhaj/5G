@@ -129,16 +129,21 @@ ByteBuffer MacLayer::process_tx(std::vector<LcData> channels, size_t tb_size) {
                       return a.priority < b.priority;
                   });
 
-        // Per-channel cursor and remaining PBR quota
-        std::vector<size_t>   sdu_idx(channels.size(), 0);
-        std::vector<uint32_t> pbr_rem(channels.size());
-        for (size_t ci = 0; ci < channels.size(); ++ci)
-            pbr_rem[ci] = channels[ci].pbr_bytes;
+        // Per-channel cursor and remaining PBR quota.
+        // Opt: reserve+push_back initialises pbr_rem in one write per element
+        // instead of zero-init then overwrite. Cache num_ch to avoid repeated
+        // size() calls in loop conditions.
+        const size_t num_ch = channels.size();
+        std::vector<size_t>   sdu_idx(num_ch, 0);
+        std::vector<uint32_t> pbr_rem;
+        pbr_rem.reserve(num_ch);
+        for (const auto& ch : channels)
+            pbr_rem.push_back(ch.pbr_bytes);
 
         bool tb_full = false;
 
         // PBR phase
-        for (size_t ci = 0; ci < channels.size() && !tb_full; ++ci) {
+        for (size_t ci = 0; ci < num_ch && !tb_full; ++ci) {
             const LcData& ch = channels[ci];
             while (sdu_idx[ci] < ch.sdus.size() && !tb_full) {
                 const ByteBuffer& sdu = ch.sdus[sdu_idx[ci]];
@@ -155,7 +160,7 @@ ByteBuffer MacLayer::process_tx(std::vector<LcData> channels, size_t tb_size) {
         bool any_left = true;
         while (any_left && !tb_full) {
             any_left = false;
-            for (size_t ci = 0; ci < channels.size() && !tb_full; ++ci) {
+            for (size_t ci = 0; ci < num_ch && !tb_full; ++ci) {
                 const LcData& ch = channels[ci];
                 if (sdu_idx[ci] >= ch.sdus.size()) continue;
                 any_left = true;
@@ -210,24 +215,29 @@ ByteBuffer MacLayer::process_tx(std::vector<LcData> channels, size_t tb_size) {
 //   6. Deliver the SDU to the output vector
 // ============================================================
 std::vector<ByteBuffer> MacLayer::process_rx(const ByteBuffer& transport_block) {
-    std::vector<ByteBuffer> sdus;
-    size_t pos     = 0;
     size_t tb_size = transport_block.size();
+    std::vector<ByteBuffer> sdus;
+    // Opt: pre-allocate capacity to avoid reallocations as SDUs are pushed.
+    // tb_size/3 is a worst-case upper bound (smallest valid SDU = 3 bytes).
+    sdus.reserve(tb_size / 3);
 
+    size_t pos = 0;
     while (pos < tb_size) {
         uint8_t byte0 = transport_block.data[pos++];
         uint8_t lcid  = byte0 & 0x3F;
 
+        // Opt: check padding first — it terminates virtually every TB, so this
+        // is the most common branch. BSR is rare (only when bsr_enabled=true).
+        if (lcid == LCID_PADDING) break;
+
         // Short BSR MAC CE (Member 6) — 1-byte payload, consume and skip.
-        // Logging suppressed here (hot path); use process_rx_multi for diagnostics.
+        // Logging suppressed in this hot path; use process_rx_multi for diagnostics.
         if (lcid == LCID_BSR) {
             if (pos < tb_size) pos++;  // skip 1-byte BSR payload
             continue;
         }
 
         bool f_bit = (byte0 >> 6) & 0x01;
-
-        if (lcid == LCID_PADDING) break;
 
         uint32_t sdu_len = 0;
         if (f_bit) {
@@ -265,15 +275,20 @@ std::vector<ByteBuffer> MacLayer::process_rx(const ByteBuffer& transport_block) 
 // ============================================================
 std::vector<std::pair<uint8_t, ByteBuffer>>
 MacLayer::process_rx_multi(const ByteBuffer& transport_block) {
-    std::vector<std::pair<uint8_t, ByteBuffer>> result;
-    size_t pos     = 0;
     size_t tb_size = transport_block.size();
+    std::vector<std::pair<uint8_t, ByteBuffer>> result;
+    // Opt: pre-allocate capacity — same heuristic as process_rx.
+    result.reserve(tb_size / 3);
 
+    size_t pos = 0;
     while (pos < tb_size) {
         uint8_t byte0 = transport_block.data[pos++];
         uint8_t lcid  = byte0 & 0x3F;
 
-        // Short BSR MAC CE — 1-byte payload, log and skip
+        // Opt: padding check first — most common exit path.
+        if (lcid == LCID_PADDING) break;
+
+        // Short BSR MAC CE — 1-byte payload, log and skip.
         if (lcid == LCID_BSR) {
             if (pos < tb_size) {
                 uint8_t bsr_val = transport_block.data[pos++];
@@ -283,8 +298,6 @@ MacLayer::process_rx_multi(const ByteBuffer& transport_block) {
         }
 
         bool f_bit = (byte0 >> 6) & 0x01;
-
-        if (lcid == LCID_PADDING) break;
 
         uint32_t sdu_len = 0;
         if (f_bit) {

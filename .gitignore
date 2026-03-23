@@ -33,3 +33,6 @@ plan.md
 .idea/
 
 AI_RULES.md
+
+# Local-only reports (not pushed to remote)
+docs/mac_layer_report_member5.md
