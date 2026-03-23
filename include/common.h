@@ -50,6 +50,25 @@ struct Config {
     // --- MAC (TS 38.321 simplified) ---
     uint8_t  logical_channel_id  = 4;       // DTCH (LCID 4 for first DRB)
     uint32_t transport_block_size = 2048;   // fixed TB size for V1
+
+    // --- RLC AM extensions (Pair B, Member 3) ---
+    uint8_t  rlc_am_sn_length    = 12;     // SN bit-width for AM mode (always 12 per TS 38.322)
+    uint16_t rlc_poll_pdu        = 64;     // Poll every N PDUs (P-bit trigger threshold)
+
+    // --- RLC loss simulation (Pair B, Member 4) ---
+    double   loss_rate           = 0.0;    // PDU drop probability [0.0, 1.0); 0.0 = no loss
+
+    // --- RLC optimization level (Pair B) ---
+    // 0 = V1 unoptimized baseline (no reserve, copy push_back, insert-loop reassembly, always sort)
+    // 1 = optimized (reserve, std::move, resize+memcpy, 2-segment fast path)
+    // Default 0 preserves V1 behavior for all existing tests.
+    uint8_t  rlc_opt_level       = 1;
+
+    // --- Benchmark CSV output (Pair B) ---
+    // If non-empty, profile_variants() writes one row per iteration to this file.
+    // Columns: pkt_size, variant, iteration, tx_us, rx_us, pass
+    // Default empty = no CSV output.
+    std::string benchmark_csv_path = "";
 };
 
 // ============================================================
