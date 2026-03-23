@@ -33,7 +33,3 @@ plan.md
 .idea/
 
 AI_RULES.md
-
-# Local-only reports and context files (not pushed to remote)
-docs/mac_benchmark_v3.html
-mac_context_for_opus.md

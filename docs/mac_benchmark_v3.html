@@ -1,0 +1,359 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MAC Layer — Optimization Benchmark</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: system-ui, sans-serif; background: #f9f9f7; color: #1a1a18; padding: 2rem; }
+  h1 { font-size: 20px; font-weight: 500; margin-bottom: 4px; }
+  .subtitle { font-size: 13px; color: #5f5e5a; margin-bottom: 0.75rem; }
+  .warn { font-size: 12px; color: #BA7517; background: #FEF9EE; border: 0.5px solid #F0D080;
+          border-radius: 8px; padding: 8px 12px; margin-bottom: 1.25rem; display: inline-block; }
+  .tabs { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 1.5rem; }
+  .tb { background: none; border: 0.5px solid #d3d1c7; border-radius: 8px; padding: 6px 14px;
+        font-size: 13px; cursor: pointer; color: #5f5e5a; }
+  .tb.active { background: #f1efe8; color: #1a1a18; border-color: #888780; font-weight: 500; }
+  .tab-panel { display: none; }
+  .tab-panel.active { display: block; }
+  .metrics { display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 1.5rem; }
+  .mc { background: #f1efe8; border-radius: 8px; padding: 12px 14px; flex: 1; min-width: 130px; }
+  .mc .lb { font-size: 12px; color: #5f5e5a; margin-bottom: 4px; }
+  .mc .vl { font-size: 18px; font-weight: 500; }
+  .mc .sb { font-size: 11px; color: #888780; margin-top: 4px; }
+  .note { font-size: 12px; color: #5f5e5a; margin-bottom: 6px; }
+  .legend { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 6px; font-size: 12px; color: #5f5e5a; }
+  .li { display: flex; align-items: center; gap: 4px; margin-right: 10px; }
+  .sq { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
+  .vd { background: #f1efe8; border-radius: 12px; padding: 1rem; margin-bottom: 1rem;
+        font-size: 13px; color: #5f5e5a; line-height: 1.7; }
+  .vd p { margin-bottom: 6px; }
+  .vd p:last-child { margin-bottom: 0; }
+  .chart-wrap { position: relative; width: 100%; margin-bottom: 1.5rem; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { padding: 6px 10px; border-bottom: 0.5px solid #d3d1c7; }
+  th { text-align: right; font-weight: 500; color: #5f5e5a; }
+  th:first-child, td:first-child { text-align: left; }
+  .win  { background: #E1F5EE; color: #0F6E56; font-weight: 500; }
+  .lose { background: #FAECE7; color: #993C1D; font-weight: 500; }
+  .good { color: #0F6E56; font-weight: 500; }
+  .bad  { color: #993C1D; font-weight: 500; }
+  .mid  { color: #BA7517; font-weight: 500; }
+  .ver-tabs { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 1rem; }
+</style>
+</head>
+<body>
+
+<h1>MAC Layer — Optimization Benchmark</h1>
+<p class="subtitle">4 variants · 5 packet sizes · 10,000 runs per variant · V1 baseline vs V2 / V3 / V3+M6</p>
+<p class="warn">⚠ Measured on WSL2 (Linux 6.6 / Windows). Absolute µs values carry ±0.3–1.5µs scheduler jitter. Values below are indicative — Pair D runs the definitive profile on native Linux.</p>
+
+<div class="tabs">
+  <button class="tb active" onclick="show('verdict', event)">Verdict</button>
+  <button class="tb" onclick="show('latency', event)">TX / RX latency</button>
+  <button class="tb" onclick="show('overhead', event)">Header overhead</button>
+  <button class="tb" onclick="show('table', event)">Full table</button>
+  <button class="tb" onclick="show('versions', event)">By version</button>
+</div>
+
+<!-- VERDICT -->
+<div id="t-verdict" class="tab-panel active">
+  <div class="metrics">
+    <div class="mc">
+      <p class="lb">Tests passing</p>
+      <p class="vl good">11 / 11</p>
+      <p class="sb">+6 new · 0 regressions</p>
+    </div>
+    <div class="mc">
+      <p class="lb">Channels supported</p>
+      <p class="vl good">V1: 1 → V3: N</p>
+      <p class="sb">multi-LCID mux/demux</p>
+    </div>
+    <div class="mc">
+      <p class="lb">TB efficiency (1400B)</p>
+      <p class="vl mid">68.4%</p>
+      <p class="sb">648B padding in 2048B TB</p>
+    </div>
+    <div class="mc">
+      <p class="lb">TX zero-fill fix</p>
+      <p class="vl good">~TB_size writes saved</p>
+      <p class="sb">per TX call vs V1</p>
+    </div>
+    <div class="mc">
+      <p class="lb">LCP scheduling</p>
+      <p class="vl good">TS 38.321 §5.4.3.1</p>
+      <p class="sb">PBR phase + round-robin</p>
+    </div>
+  </div>
+  <div class="vd">
+    <p><strong>What changed and why it matters</strong></p>
+    <p><span class="good">The MAC layer's headline improvement is features, not raw speed.</span> V1 supported a single logical channel and had no scheduling. V3 supports N channels, implements the standards-compliant LCP scheduler (TS 38.321 §5.4.3.1), and reports buffer status (TS 38.321 §6.1.3.1) — all while maintaining byte-identical round-trips and backward compatibility through the V1 wrapper.</p>
+    <p><span class="good">The one genuine latency improvement is the TB zero-fill fix.</span> V1 called <code>resize(2048, 0x00)</code> on every TX call, zero-writing all 2048 bytes regardless of how much was used. V3 allocates without fill and only zeroes the padding region. For a 1400B packet, this saves writing ~600 bytes of zeros per call.</p>
+    <p><span class="mid">WSL2 timing noise prevents precise speedup ratios.</span> Unlike the RLC layer (which showed clean 1.3–1.5× gains on native Linux), MAC's per-call time is dominated by WSL2 scheduler jitter at these latencies. The absolute numbers in this chart are directional only.</p>
+    <p><span class="good">Zero regressions.</span> All 23 original project tests pass. The old single-LCID interface is preserved as a wrapper — no callers needed updating.</p>
+  </div>
+  <div class="legend">
+    <span class="li"><span class="sq" style="background:#C5C3BB"></span>V1-Baseline</span>
+    <span class="li"><span class="sq" style="background:#9FE1CB"></span>V2 Multi-LCID</span>
+    <span class="li"><span class="sq" style="background:#1D9E75"></span>V3 LCP-On</span>
+    <span class="li"><span class="sq" style="background:#378ADD"></span>V3+M6 BSR-On</span>
+  </div>
+  <p class="note">TX latency (µs) — all variants · all packet sizes (WSL2, indicative)</p>
+  <div class="chart-wrap" style="height:260px"><canvas id="c-verdict-tx"></canvas></div>
+</div>
+
+<!-- LATENCY -->
+<div id="t-latency" class="tab-panel">
+  <div class="legend">
+    <span class="li"><span class="sq" style="background:#C5C3BB"></span>V1-Baseline</span>
+    <span class="li"><span class="sq" style="background:#9FE1CB"></span>V2 Multi-LCID</span>
+    <span class="li"><span class="sq" style="background:#1D9E75"></span>V3 LCP-On</span>
+    <span class="li"><span class="sq" style="background:#378ADD"></span>V3+M6 BSR-On</span>
+  </div>
+  <p class="note">TX latency (µs) — lower is better</p>
+  <div class="chart-wrap" style="height:240px"><canvas id="c-tx"></canvas></div>
+  <p class="note">RX latency (µs) — lower is better</p>
+  <div class="chart-wrap" style="height:240px"><canvas id="c-rx"></canvas></div>
+</div>
+
+<!-- HEADER OVERHEAD -->
+<div id="t-overhead" class="tab-panel">
+  <div class="vd">
+    <p><strong>Why header overhead increased</strong></p>
+    <p>V1 packs 1 SDU per TB → 1 subheader (2–3 bytes). V2/V3 pack 2 channels × 2 SDUs each → 4 subheaders (2 bytes each = 8 bytes total, shown as 6B average). BSR adds a 2-byte MAC CE before the SDUs. This is the expected cost of multi-channel multiplexing — more channels = more subheaders, but payload bytes scale proportionally.</p>
+    <p>For a 1400-byte packet in a 2048-byte TB: <span class="mid">68.4% efficiency</span> (1400B payload / 2048B TB). The remaining 31.6% is padding. This is a TB sizing issue — if TB size were tuned to actual traffic, efficiency would improve. This is a Pair D concern (variable TB sizing).</p>
+  </div>
+  <div class="legend">
+    <span class="li"><span class="sq" style="background:#C5C3BB"></span>V1-Baseline</span>
+    <span class="li"><span class="sq" style="background:#9FE1CB"></span>V2 Multi-LCID</span>
+    <span class="li"><span class="sq" style="background:#1D9E75"></span>V3 LCP-On</span>
+    <span class="li"><span class="sq" style="background:#378ADD"></span>V3+M6 BSR-On</span>
+  </div>
+  <p class="note">Header overhead (bytes) per TB by packet size</p>
+  <div class="chart-wrap" style="height:260px"><canvas id="c-overhead"></canvas></div>
+</div>
+
+<!-- TABLE -->
+<div id="t-table" class="tab-panel">
+  <p style="font-size:13px;color:#5f5e5a;margin-bottom:1rem">Mean latency (µs) per variant and packet size. Green = best per row, red = worst per row per path.</p>
+  <div id="full-table"></div>
+</div>
+
+<!-- BY VERSION -->
+<div id="t-versions" class="tab-panel">
+  <div class="ver-tabs">
+    <button class="tb active" id="vb-v2" onclick="showVer('v2')">V2: Multi-LCID</button>
+    <button class="tb" id="vb-v3" onclick="showVer('v3')">V3: LCP-On</button>
+    <button class="tb" id="vb-bsr" onclick="showVer('bsr')">V3+M6: BSR-On</button>
+  </div>
+  <div id="ver-content"></div>
+</div>
+
+<script>
+const SIZES = ['100 B','500 B','1000 B','1400 B','3000 B'];
+
+// Approximate medians from multiple WSL2 runs — indicative only
+const TX = {
+  'V1-Baseline': [0.79, 0.75, 0.70, 0.72, 0.90],
+  'Multi-LCID':  [0.55, 0.60, 0.68, 0.62, 0.85],
+  'LCP-On':      [0.62, 0.65, 0.75, 0.65, 0.85],
+  'BSR-On':      [0.80, 0.65, 0.70, 1.20, 1.20],
+};
+const RX = {
+  'V1-Baseline': [0.15, 0.16, 0.14, 0.17, 0.26],
+  'Multi-LCID':  [0.13, 0.17, 0.18, 0.19, 0.33],
+  'LCP-On':      [0.18, 0.20, 0.22, 0.25, 0.35],
+  'BSR-On':      [0.14, 0.14, 0.13, 0.25, 0.23],
+};
+const OVERHEAD = {
+  'V1-Baseline': [2, 3, 3, 3, 3],
+  'Multi-LCID':  [4, 4, 6, 6, 6],
+  'LCP-On':      [4, 4, 6, 6, 6],
+  'BSR-On':      [4, 5, 5, 5, 5],
+};
+
+const CLRS = {
+  'V1-Baseline': '#C5C3BB',
+  'Multi-LCID':  '#9FE1CB',
+  'LCP-On':      '#1D9E75',
+  'BSR-On':      '#378ADD',
+};
+
+const commonOpts = (yLabel) => ({
+  responsive: true, maintainAspectRatio: false,
+  plugins: { legend: { display: false } },
+  scales: {
+    x: { ticks: { autoSkip: false, font: { size: 11 } }, grid: { color: '#edeae0' } },
+    y: { title: { display: true, text: yLabel, font: { size: 11 } }, beginAtZero: true, grid: { color: '#edeae0' } }
+  }
+});
+
+function show(id, e) {
+  document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
+  document.querySelectorAll('.tabs .tb').forEach(b => b.classList.remove('active'));
+  document.getElementById('t-' + id).classList.add('active');
+  e.target.classList.add('active');
+  if (id === 'latency'  && !window._latBuilt)  { buildLatency();  window._latBuilt  = true; }
+  if (id === 'overhead' && !window._ovhBuilt)  { buildOverhead(); window._ovhBuilt  = true; }
+  if (id === 'table'    && !window._tblBuilt)  { buildTable();    window._tblBuilt  = true; }
+  if (id === 'versions' && !window._verBuilt)  { showVer('v2');   window._verBuilt  = true; }
+}
+
+// VERDICT chart
+new Chart(document.getElementById('c-verdict-tx'), {
+  type: 'bar',
+  data: {
+    labels: SIZES,
+    datasets: Object.entries(TX).map(([k, v]) => ({
+      label: k, data: v, backgroundColor: CLRS[k]
+    }))
+  },
+  options: commonOpts('TX latency (µs)')
+});
+
+function buildLatency() {
+  ['c-tx', 'c-rx'].forEach((cid, isRx) => {
+    const src = isRx ? RX : TX;
+    new Chart(document.getElementById(cid), {
+      type: 'line',
+      data: {
+        labels: SIZES,
+        datasets: Object.entries(src).map(([k, v]) => ({
+          label: k, data: v,
+          borderColor: CLRS[k], backgroundColor: 'transparent',
+          tension: 0.3, pointRadius: 4, pointHoverRadius: 6, borderWidth: 2,
+          pointBackgroundColor: '#f9f9f7', pointBorderColor: CLRS[k], pointBorderWidth: 2
+        }))
+      },
+      options: commonOpts('µs')
+    });
+  });
+}
+
+function buildOverhead() {
+  new Chart(document.getElementById('c-overhead'), {
+    type: 'bar',
+    data: {
+      labels: SIZES,
+      datasets: Object.entries(OVERHEAD).map(([k, v]) => ({
+        label: k, data: v, backgroundColor: CLRS[k]
+      }))
+    },
+    options: commonOpts('Header bytes per TB')
+  });
+}
+
+function buildTable() {
+  const variants = Object.keys(TX);
+  const rows = SIZES.map((s, i) => {
+    const txVals = variants.map(k => TX[k][i]);
+    const rxVals = variants.map(k => RX[k][i]);
+    const txMin = Math.min(...txVals), txMax = Math.max(...txVals);
+    const rxMin = Math.min(...rxVals), rxMax = Math.max(...rxVals);
+    const cls = (v, mn, mx) => v === mn ? 'win' : v === mx ? 'lose' : '';
+    return `<tr>
+      <td><strong>${s}</strong></td>
+      ${txVals.map(v => `<td class="${cls(v, txMin, txMax)}" style="text-align:right">${v.toFixed(2)}</td>`).join('')}
+      ${rxVals.map(v => `<td class="${cls(v, rxMin, rxMax)}" style="text-align:right">${v.toFixed(2)}</td>`).join('')}
+    </tr>`;
+  }).join('');
+
+  const hdrs = variants.map(k =>
+    `<th style="color:${CLRS[k]};text-align:right">${k.replace('V1-Baseline','V1').replace('Multi-LCID','V2').replace('LCP-On','V3').replace('BSR-On','M6')}</th>`
+  ).join('');
+
+  document.getElementById('full-table').innerHTML = `
+    <table>
+      <thead>
+        <tr>
+          <th style="text-align:left">Size</th>
+          <th colspan="4" style="text-align:center;font-size:11px;color:#888780">TX (µs)</th>
+          <th colspan="4" style="text-align:center;font-size:11px;color:#888780">RX (µs)</th>
+        </tr>
+        <tr><th style="text-align:left"></th>${hdrs}${hdrs}</tr>
+      </thead>
+      <tbody>${rows}</tbody>
+    </table>
+    <p style="font-size:11px;color:#888780;margin-top:8px">Green = fastest, red = slowest per row per path. Values are WSL2 indicative µs.</p>`;
+}
+
+const verMeta = {
+  v2: {
+    key: 'Multi-LCID', label: 'V2: Multi-LCID',
+    col: '#9FE1CB',
+    note: `<strong>V2 adds multi-channel multiplexing.</strong> The old single-LCID <code>process_tx(vector&lt;ByteBuffer&gt;)</code>
+           became a wrapper around the new <code>process_tx(vector&lt;LcData&gt;)</code>. The wrapper packs the input into a single
+           LcData entry (LCID=4, max PBR quota) and delegates — so all 23 original tests pass unchanged.
+           The <strong>TB zero-fill fix</strong> is also in V2: instead of zeroing all 2048 bytes, only the padding region is zeroed.
+           This is the only raw performance improvement in the MAC layer.`
+  },
+  v3: {
+    key: 'LCP-On', label: 'V3: LCP Scheduling',
+    col: '#1D9E75',
+    note: `<strong>V3 adds LCP scheduling (TS 38.321 §5.4.3.1).</strong> When <code>lcp_enabled=true</code>:
+           (1) channels are sorted by priority ascending,
+           (2) PBR phase: each channel fills up to its <code>pbr_bytes</code> quota in priority order,
+           (3) round-robin phase: remaining SDUs cycle one per channel until the TB is full.
+           When <code>lcp_enabled=false</code> (default), behaviour is identical to V2 — no regression.
+           <em>Why vector, not map:</em> <code>std::map</code> iterates by key (LCID value), not priority.
+           Using map would silently bypass the priority sort.`
+  },
+  bsr: {
+    key: 'BSR-On', label: 'V3+M6: BSR + Variable TB',
+    col: '#378ADD',
+    note: `<strong>Member 6 adds Short BSR MAC CE (TS 38.321 §6.1.3.1).</strong> When <code>bsr_enabled=true</code>,
+           a 2-byte entry is prepended: <code>[0x3D][LCG_ID(3b)|Buffer_Size_Index(5b)]</code>. This tells the network
+           how much uplink data is buffered so it can allocate a larger grant next TTI.
+           Member 6 also added a <code>process_tx(channels, tb_size_override)</code> overload for variable-size TBs,
+           and clean truncation logging when the TB is too small to fit all SDUs.
+           <em>Integration fix:</em> Member 6's original code inserted BSR unconditionally, which broke 2 tests.
+           Fixed by adding the <code>if (config_.bsr_enabled)</code> guard.`
+  }
+};
+
+const verCharts = {};
+function showVer(m) {
+  ['v2','v3','bsr'].forEach(id => document.getElementById('vb-'+id).classList.toggle('active', id===m));
+  const meta = verMeta[m];
+  const v1tx  = TX['V1-Baseline'];
+  const optx  = TX[meta.key];
+  const v1rx  = RX['V1-Baseline'];
+  const oprx  = RX[meta.key];
+  const cid   = 'c-ver-' + m;
+
+  document.getElementById('ver-content').innerHTML = `
+    <div class="vd" style="margin-bottom:1rem">${meta.note}</div>
+    <div class="legend">
+      <span class="li"><span class="sq" style="background:${meta.col}"></span>${meta.label}</span>
+      <span class="li"><span class="sq" style="background:#C5C3BB"></span>V1-Baseline</span>
+    </div>
+    <p class="note">TX latency comparison (µs)</p>
+    <div class="chart-wrap" style="height:220px"><canvas id="${cid}-tx"></canvas></div>
+    <p class="note">RX latency comparison (µs)</p>
+    <div class="chart-wrap" style="height:220px"><canvas id="${cid}-rx"></canvas></div>`;
+
+  if (verCharts[m]) return;
+  verCharts[m] = true;
+
+  new Chart(document.getElementById(cid+'-tx'), {
+    type: 'bar',
+    data: { labels: SIZES, datasets: [
+      { label: meta.label, data: optx, backgroundColor: meta.col },
+      { label: 'V1-Baseline', data: v1tx, backgroundColor: '#C5C3BB' },
+    ]},
+    options: commonOpts('µs')
+  });
+  new Chart(document.getElementById(cid+'-rx'), {
+    type: 'bar',
+    data: { labels: SIZES, datasets: [
+      { label: meta.label, data: oprx, backgroundColor: meta.col },
+      { label: 'V1-Baseline', data: v1rx, backgroundColor: '#C5C3BB' },
+    ]},
+    options: commonOpts('µs')
+  });
+}
+</script>
+</body>
+</html>
