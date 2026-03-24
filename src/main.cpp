@@ -64,12 +64,16 @@ static double elapsed_us(Clock::time_point start, Clock::time_point end) {
 // ============================================================
 struct PacketProfile {
     uint32_t seq;
+    uint32_t packet_size;
+    uint32_t tb_size;
     double pdcp_tx_us;
     double rlc_tx_us;
     double mac_tx_us;
     double mac_rx_us;
     double rlc_rx_us;
     double pdcp_rx_us;
+    double total_tx_us;
+    double total_rx_us;
     bool   pass;
 };
 
@@ -102,6 +106,8 @@ int main(int argc, char* argv[]) {
     for (uint32_t seq = 0; seq < cfg.num_packets; seq++) {
         PacketProfile pp{};
         pp.seq = seq;
+        pp.packet_size = cfg.ip_packet_size;
+        pp.tb_size = cfg.transport_block_size;
 
         // ---- Generate the original IP packet ----
         ByteBuffer original_ip = ip_gen.generate_packet(seq);
@@ -166,6 +172,10 @@ int main(int argc, char* argv[]) {
         // ============================================================
         pp.pass = ip_gen.verify_packet(original_ip, recovered_ip);
 
+        // Calculate total times
+        pp.total_tx_us = pp.pdcp_tx_us + pp.rlc_tx_us + pp.mac_tx_us;
+        pp.total_rx_us = pp.mac_rx_us + pp.rlc_rx_us + pp.pdcp_rx_us;
+
         if (pp.pass) {
             pass_count++;
             std::cout << "  Packet " << std::setw(4) << seq << ": PASS";
@@ -175,10 +185,8 @@ int main(int argc, char* argv[]) {
         }
 
         // Print per-packet timing summary
-        double total_ul = pp.pdcp_tx_us + pp.rlc_tx_us + pp.mac_tx_us;
-        double total_dl = pp.mac_rx_us  + pp.rlc_rx_us  + pp.pdcp_rx_us;
         std::cout << "  |  UL: " << std::fixed << std::setprecision(1)
-                  << total_ul << " us  DL: " << total_dl << " us"
+                  << pp.total_tx_us << " us  DL: " << pp.total_rx_us << " us"
                   << "  |  RLC segments: " << rlc_pdus.size() << "\n";
 
         profiles.push_back(pp);
@@ -227,9 +235,16 @@ int main(int argc, char* argv[]) {
     // ============================================================
     std::ofstream csv("profiling_results.csv");
     if (csv.is_open()) {
-        csv << "seq,pdcp_tx_us,rlc_tx_us,mac_tx_us,mac_rx_us,rlc_rx_us,pdcp_rx_us,pass\n";
+        // Enhanced CSV header with packet_size, tb_size, and total times
+        csv << "seq,packet_size,tb_size,"
+            << "pdcp_tx_us,rlc_tx_us,mac_tx_us,"
+            << "mac_rx_us,rlc_rx_us,pdcp_rx_us,"
+            << "total_tx_us,total_rx_us,total_us,pass\n";
+        
         for (auto& p : profiles) {
             csv << p.seq << ","
+                << p.packet_size << ","
+                << p.tb_size << ","
                 << std::fixed << std::setprecision(3)
                 << p.pdcp_tx_us << ","
                 << p.rlc_tx_us  << ","
@@ -237,6 +252,9 @@ int main(int argc, char* argv[]) {
                 << p.mac_rx_us  << ","
                 << p.rlc_rx_us  << ","
                 << p.pdcp_rx_us << ","
+                << p.total_tx_us << ","
+                << p.total_rx_us << ","
+                << (p.total_tx_us + p.total_rx_us) << ","
                 << (p.pass ? "PASS" : "FAIL") << "\n";
         }
         csv.close();
