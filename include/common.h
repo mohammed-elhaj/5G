@@ -69,6 +69,11 @@ struct Config {
     // Columns: pkt_size, variant, iteration, tx_us, rx_us, pass
     // Default empty = no CSV output.
     std::string benchmark_csv_path = "";
+    // === Member 1: PDCP algorithm selection ===
+    // 0 = V1 originals (XOR cipher, CRC32 integrity)
+    // 1 = Optimized (AES-128-CTR cipher, HMAC-SHA256 integrity)
+    uint8_t  cipher_algorithm    = 0;  // 0 = XOR (V1 default), 1 = AES-128-CTR
+    uint8_t  integrity_algorithm = 0;  // 0 = CRC32 (V1 default), 1 = HMAC-SHA256
 };
 
 // ============================================================
