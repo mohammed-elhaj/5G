@@ -19,6 +19,9 @@
 #include <iostream>
 #include <cstring>
 #include <stdexcept>
+#include <openssl/evp.h>
+#include <openssl/hmac.h>
+#include <openssl/err.h>
 
 // ============================================================
 // CRC32 lookup table (ISO 3309 / ITU-T V.42 polynomial 0xEDB88320)
@@ -55,6 +58,8 @@ PdcpLayer::PdcpLayer(const Config& cfg) : config_(cfg) {}
 void PdcpLayer::reset() {
     tx_next_ = 0;
     rx_next_ = 0;
+    tx_comp_ctx_ = CompressionContext{};
+    rx_comp_ctx_ = CompressionContext{};
 }
 
 // ============================================================
@@ -77,36 +82,314 @@ std::vector<uint8_t> PdcpLayer::generate_keystream(uint32_t count, size_t length
 // deciphers.
 // ============================================================
 void PdcpLayer::apply_cipher(std::vector<uint8_t>& data, uint32_t count) {
-    auto ks = generate_keystream(count, data.size());
-    for (size_t i = 0; i < data.size(); i++) {
-        data[i] ^= ks[i];
+    if (config_.cipher_algorithm == 0) {
+        // V1: XOR stream cipher (original code, unchanged)
+        auto ks = generate_keystream(count, data.size());
+        for (size_t i = 0; i < data.size(); i++) {
+            data[i] ^= ks[i];
+        }
+    } else if (config_.cipher_algorithm == 1) {
+        // Optimized: AES-128-CTR (per TS 38.323 §5.8, NEA2)
+        apply_cipher_aes_ctr(data, count);
     }
 }
 
+// ============================================================
+// AES-128-CTR cipher — replaces XOR stream cipher when
+// config_.cipher_algorithm == 1.
+//
+// Per TS 38.323 §5.8, NEA2 uses AES-128 in CTR mode.
+// IV = COUNT(4 bytes) || BEARER(1 byte) || DIRECTION(1 byte) || zeros(10 bytes)
+//
+// AES-CTR is self-inverse: same operation encrypts and decrypts.
+// AI-assisted: reviewed by Member 1
+// ============================================================
+void PdcpLayer::apply_cipher_aes_ctr(std::vector<uint8_t>& data, uint32_t count) {
+    // Build 16-byte IV per TS 38.323 ciphering input parameters
+    uint8_t iv[16] = {0};
+    iv[0] = static_cast<uint8_t>((count >> 24) & 0xFF);
+    iv[1] = static_cast<uint8_t>((count >> 16) & 0xFF);
+    iv[2] = static_cast<uint8_t>((count >> 8) & 0xFF);
+    iv[3] = static_cast<uint8_t>(count & 0xFF);
+    iv[4] = 0x01;  // BEARER ID (single DRB)
+    iv[5] = 0x00;  // DIRECTION (0 for both TX/RX in loopback simulation)
+
+    EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+    if (!ctx) {
+        std::cerr << "[PDCP] Failed to create EVP cipher context\n";
+        return;
+    }
+
+    // AES-128-CTR: same call encrypts and decrypts
+    if (EVP_EncryptInit_ex(ctx, EVP_aes_128_ctr(), nullptr,
+                           config_.cipher_key, iv) != 1) {
+        std::cerr << "[PDCP] EVP_EncryptInit_ex failed\n";
+        EVP_CIPHER_CTX_free(ctx);
+        return;
+    }
+
+    std::vector<uint8_t> output(data.size() + EVP_CIPHER_block_size(EVP_aes_128_ctr()));
+    int out_len = 0;
+
+    if (EVP_EncryptUpdate(ctx, output.data(), &out_len,
+                          data.data(), static_cast<int>(data.size())) != 1) {
+        std::cerr << "[PDCP] EVP_EncryptUpdate failed\n";
+        EVP_CIPHER_CTX_free(ctx);
+        return;
+    }
+
+    int final_len = 0;
+    if (EVP_EncryptFinal_ex(ctx, output.data() + out_len, &final_len) != 1) {
+        std::cerr << "[PDCP] EVP_EncryptFinal_ex failed\n";
+        EVP_CIPHER_CTX_free(ctx);
+        return;
+    }
+
+    output.resize(out_len + final_len);
+    data = std::move(output);
+
+    EVP_CIPHER_CTX_free(ctx);
+}
+
+// ============================================================
+// Simplified ROHC-style header compression (Member 2)
+//
+// Per TS 38.323 §5.6, PDCP supports header compression using
+// ROHC (RFC 5795). Our simplified implementation:
+//   - First packet: store static IPv4 fields as context, send uncompressed
+//   - Subsequent packets: replace 20-byte IPv4 header with 7-byte
+//     compressed header (marker + dynamic fields only)
+//
+// Compressed format:
+//   Byte 0:   0xFC (marker — invalid as IPv4 version/IHL, so unambiguous)
+//   Byte 1-2: Total Length (from original IPv4 bytes 2-3)
+//   Byte 3-4: Identification (from original IPv4 bytes 4-5)
+//   Byte 5-6: Header Checksum (from original IPv4 bytes 10-11)
+//   Byte 7+:  Original payload (everything after the 20-byte IP header)
+//
+// Saves 13 bytes per packet (20 - 7 = 13) after context is established.
+// AI-assisted: reviewed by Member 1
+// ============================================================
+std::vector<uint8_t> PdcpLayer::compress_header(const std::vector<uint8_t>& data) {
+    // Need at least a 20-byte IPv4 header to compress
+    if (data.size() < IPV4_HEADER_SIZE) return data;
+
+    // Only compress IPv4 packets (version=4, IHL=5 → first byte = 0x45)
+    if (data[0] != 0x45) return data;
+
+    if (!tx_comp_ctx_.context_established) {
+        // First packet: establish context by storing static fields
+        tx_comp_ctx_.version_ihl    = data[0];
+        tx_comp_ctx_.dscp_ecn       = data[1];
+        tx_comp_ctx_.flags_fragment = (static_cast<uint16_t>(data[6]) << 8) | data[7];
+        tx_comp_ctx_.ttl            = data[8];
+        tx_comp_ctx_.protocol       = data[9];
+        tx_comp_ctx_.src_ip         = (static_cast<uint32_t>(data[12]) << 24) |
+                                      (static_cast<uint32_t>(data[13]) << 16) |
+                                      (static_cast<uint32_t>(data[14]) << 8)  |
+                                      static_cast<uint32_t>(data[15]);
+        tx_comp_ctx_.dst_ip         = (static_cast<uint32_t>(data[16]) << 24) |
+                                      (static_cast<uint32_t>(data[17]) << 16) |
+                                      (static_cast<uint32_t>(data[18]) << 8)  |
+                                      static_cast<uint32_t>(data[19]);
+        tx_comp_ctx_.context_established = true;
+
+        // First packet is sent UNCOMPRESSED (like ROHC IR state)
+        return data;
+    }
+
+    // Subsequent packets: compress by replacing 20-byte header with 7-byte compressed header
+    // Extract dynamic fields from the original IPv4 header
+    uint8_t total_len_hi = data[2];
+    uint8_t total_len_lo = data[3];
+    uint8_t ident_hi     = data[4];
+    uint8_t ident_lo     = data[5];
+    uint8_t checksum_hi  = data[10];
+    uint8_t checksum_lo  = data[11];
+
+    // Build compressed packet: [marker(1) | total_len(2) | ident(2) | checksum(2) | payload]
+    std::vector<uint8_t> compressed;
+    compressed.reserve(COMPRESSED_HEADER_SIZE + (data.size() - IPV4_HEADER_SIZE));
+
+    compressed.push_back(COMPRESSED_MARKER);
+    compressed.push_back(total_len_hi);
+    compressed.push_back(total_len_lo);
+    compressed.push_back(ident_hi);
+    compressed.push_back(ident_lo);
+    compressed.push_back(checksum_hi);
+    compressed.push_back(checksum_lo);
+
+    // Append the original payload (everything after the 20-byte IP header)
+    compressed.insert(compressed.end(), data.begin() + IPV4_HEADER_SIZE, data.end());
+
+    return compressed;
+}
 // ============================================================
 // Compute MAC-I — CRC32 over (integrity_key || count || data).
 // Produces a 4-byte integrity check value.
 // ============================================================
 uint32_t PdcpLayer::compute_mac_i(uint32_t count, const std::vector<uint8_t>& data) {
-    // Build the input buffer: integrity_key (16 bytes) + count (4 bytes) + data
-    std::vector<uint8_t> buf;
-    buf.reserve(16 + 4 + data.size());
+    if (config_.integrity_algorithm == 0) {
+        // V1: CRC32 integrity (original code, unchanged)
+        std::vector<uint8_t> buf;
+        buf.reserve(16 + 4 + data.size());
 
-    // Append the 16-byte integrity key
-    buf.insert(buf.end(), config_.integrity_key, config_.integrity_key + 16);
+        buf.insert(buf.end(), config_.integrity_key, config_.integrity_key + 16);
 
-    // Append count in big-endian
-    buf.push_back(static_cast<uint8_t>((count >> 24) & 0xFF));
-    buf.push_back(static_cast<uint8_t>((count >> 16) & 0xFF));
-    buf.push_back(static_cast<uint8_t>((count >> 8)  & 0xFF));
-    buf.push_back(static_cast<uint8_t>(count & 0xFF));
+        buf.push_back(static_cast<uint8_t>((count >> 24) & 0xFF));
+        buf.push_back(static_cast<uint8_t>((count >> 16) & 0xFF));
+        buf.push_back(static_cast<uint8_t>((count >> 8)  & 0xFF));
+        buf.push_back(static_cast<uint8_t>(count & 0xFF));
 
-    // Append the payload data
-    buf.insert(buf.end(), data.begin(), data.end());
+        buf.insert(buf.end(), data.begin(), data.end());
 
-    return crc32(buf.data(), buf.size());
+        return crc32(buf.data(), buf.size());
+    } else if (config_.integrity_algorithm == 1) {
+        // Optimized: HMAC-SHA256 (per TS 38.323 §5.9)
+        return compute_mac_i_hmac(count, data);
+    }
+
+    return 0;
 }
 
+// ============================================================
+// HMAC-SHA256 integrity — replaces CRC32 when
+// config_.integrity_algorithm == 1.
+//
+// Per TS 38.323 §5.9, integrity input includes COUNT, BEARER,
+// DIRECTION and the message. We compute HMAC-SHA256 and truncate
+// to 4 bytes to fit the MAC-I field.
+// AI-assisted: reviewed by Member 1
+// ============================================================
+uint32_t PdcpLayer::compute_mac_i_hmac(uint32_t count, const std::vector<uint8_t>& data) {
+    // Build integrity input: COUNT || BEARER || DIRECTION || payload
+    std::vector<uint8_t> message;
+    message.reserve(6 + data.size());
+
+    // COUNT (4 bytes, big-endian)
+    message.push_back(static_cast<uint8_t>((count >> 24) & 0xFF));
+    message.push_back(static_cast<uint8_t>((count >> 16) & 0xFF));
+    message.push_back(static_cast<uint8_t>((count >> 8) & 0xFF));
+    message.push_back(static_cast<uint8_t>(count & 0xFF));
+
+    // BEARER (1 byte)
+    message.push_back(0x01);
+
+    // DIRECTION (1 byte) — 0 for both TX/RX in loopback
+    message.push_back(0x00);
+
+    // Append the ciphered payload
+    message.insert(message.end(), data.begin(), data.end());
+
+    // Compute HMAC-SHA256 using the integrity key
+    unsigned char hmac_result[EVP_MAX_MD_SIZE];
+    unsigned int hmac_len = 0;
+
+    HMAC(EVP_sha256(),
+         config_.integrity_key, 16,
+         message.data(), message.size(),
+         hmac_result, &hmac_len);
+
+    // Truncate to 4 bytes for MAC-I field
+    uint32_t mac_i = (static_cast<uint32_t>(hmac_result[0]) << 24) |
+                     (static_cast<uint32_t>(hmac_result[1]) << 16) |
+                     (static_cast<uint32_t>(hmac_result[2]) << 8)  |
+                     (static_cast<uint32_t>(hmac_result[3]));
+
+    return mac_i;
+}
+
+// ============================================================
+// Decompress: restore full 20-byte IPv4 header from compressed
+// 7-byte header + stored context.
+// AI-assisted: reviewed by Member 1
+// ============================================================
+std::vector<uint8_t> PdcpLayer::decompress_header(const std::vector<uint8_t>& data) {
+    if (data.empty()) return data;
+
+    // Check if this is a compressed packet (starts with our marker)
+    if (data[0] != COMPRESSED_MARKER) {
+        // Uncompressed packet — establish decompressor context from it
+        if (data.size() >= IPV4_HEADER_SIZE && data[0] == 0x45) {
+            rx_comp_ctx_.version_ihl    = data[0];
+            rx_comp_ctx_.dscp_ecn       = data[1];
+            rx_comp_ctx_.flags_fragment = (static_cast<uint16_t>(data[6]) << 8) | data[7];
+            rx_comp_ctx_.ttl            = data[8];
+            rx_comp_ctx_.protocol       = data[9];
+            rx_comp_ctx_.src_ip         = (static_cast<uint32_t>(data[12]) << 24) |
+                                          (static_cast<uint32_t>(data[13]) << 16) |
+                                          (static_cast<uint32_t>(data[14]) << 8)  |
+                                          static_cast<uint32_t>(data[15]);
+            rx_comp_ctx_.dst_ip         = (static_cast<uint32_t>(data[16]) << 24) |
+                                          (static_cast<uint32_t>(data[17]) << 16) |
+                                          (static_cast<uint32_t>(data[18]) << 8)  |
+                                          static_cast<uint32_t>(data[19]);
+            rx_comp_ctx_.context_established = true;
+        }
+        return data;  // Already uncompressed, pass through
+    }
+
+    // This is a compressed packet — need context to decompress
+    if (!rx_comp_ctx_.context_established) {
+        std::cerr << "[PDCP RX] Cannot decompress: no context established\n";
+        return {};
+    }
+
+    if (data.size() < COMPRESSED_HEADER_SIZE) {
+        std::cerr << "[PDCP RX] Compressed packet too short\n";
+        return {};
+    }
+
+    // Extract dynamic fields from compressed header
+    uint8_t total_len_hi = data[1];
+    uint8_t total_len_lo = data[2];
+    uint8_t ident_hi     = data[3];
+    uint8_t ident_lo     = data[4];
+    uint8_t checksum_hi  = data[5];
+    uint8_t checksum_lo  = data[6];
+
+    // Reconstruct the full 20-byte IPv4 header from context + dynamic fields
+    std::vector<uint8_t> decompressed;
+    decompressed.reserve(IPV4_HEADER_SIZE + (data.size() - COMPRESSED_HEADER_SIZE));
+
+    // Byte 0: Version + IHL (from context)
+    decompressed.push_back(rx_comp_ctx_.version_ihl);
+    // Byte 1: DSCP + ECN (from context)
+    decompressed.push_back(rx_comp_ctx_.dscp_ecn);
+    // Byte 2-3: Total Length (dynamic)
+    decompressed.push_back(total_len_hi);
+    decompressed.push_back(total_len_lo);
+    // Byte 4-5: Identification (dynamic)
+    decompressed.push_back(ident_hi);
+    decompressed.push_back(ident_lo);
+    // Byte 6-7: Flags + Fragment Offset (from context)
+    decompressed.push_back(static_cast<uint8_t>((rx_comp_ctx_.flags_fragment >> 8) & 0xFF));
+    decompressed.push_back(static_cast<uint8_t>(rx_comp_ctx_.flags_fragment & 0xFF));
+    // Byte 8: TTL (from context)
+    decompressed.push_back(rx_comp_ctx_.ttl);
+    // Byte 9: Protocol (from context)
+    decompressed.push_back(rx_comp_ctx_.protocol);
+    // Byte 10-11: Header Checksum (dynamic)
+    decompressed.push_back(checksum_hi);
+    decompressed.push_back(checksum_lo);
+    // Byte 12-15: Source IP (from context)
+    decompressed.push_back(static_cast<uint8_t>((rx_comp_ctx_.src_ip >> 24) & 0xFF));
+    decompressed.push_back(static_cast<uint8_t>((rx_comp_ctx_.src_ip >> 16) & 0xFF));
+    decompressed.push_back(static_cast<uint8_t>((rx_comp_ctx_.src_ip >> 8) & 0xFF));
+    decompressed.push_back(static_cast<uint8_t>(rx_comp_ctx_.src_ip & 0xFF));
+    // Byte 16-19: Destination IP (from context)
+    decompressed.push_back(static_cast<uint8_t>((rx_comp_ctx_.dst_ip >> 24) & 0xFF));
+    decompressed.push_back(static_cast<uint8_t>((rx_comp_ctx_.dst_ip >> 16) & 0xFF));
+    decompressed.push_back(static_cast<uint8_t>((rx_comp_ctx_.dst_ip >> 8) & 0xFF));
+    decompressed.push_back(static_cast<uint8_t>(rx_comp_ctx_.dst_ip & 0xFF));
+
+    // Append the payload data (everything after the 7-byte compressed header)
+    decompressed.insert(decompressed.end(),
+                        data.begin() + COMPRESSED_HEADER_SIZE,
+                        data.end());
+
+    return decompressed;
+}
 // ============================================================
 // TX path (uplink): SDU (IP packet) → PDCP PDU
 //
@@ -127,19 +410,28 @@ ByteBuffer PdcpLayer::process_tx(const ByteBuffer& sdu) {
 
     // --- Step 2: Copy the SDU payload (the IP packet) ---
     std::vector<uint8_t> payload(sdu.data.begin(), sdu.data.end());
-
-    // --- Step 3: Cipher the payload ---
+    // ============================================================
+    // TX path modification (Member 2)
+    //
+    // Compression is applied AFTER receiving SDU
+    // and BEFORE ciphering, as required by PDCP spec.
+    // ============================================================
+    // --- Step 3:compression
+    if (config_.compression_enabled) {
+        payload = compress_header(payload);
+    }
+    // --- Step 4: Cipher the payload ---
     if (config_.ciphering_enabled) {
         apply_cipher(payload, count);
     }
 
-    // --- Step 4: Compute MAC-I over the ciphered payload ---
+    // --- Step 5: Compute MAC-I over the ciphered payload ---
     uint32_t mac_i = 0;
     if (config_.integrity_enabled) {
         mac_i = compute_mac_i(count, payload);
     }
 
-    // --- Step 5: Assemble the PDCP PDU ---
+    // --- Step 6: Assemble the PDCP PDU ---
     ByteBuffer pdu;
     size_t mac_i_size = config_.integrity_enabled ? 4 : 0;
     pdu.data.resize(header_size + payload.size() + mac_i_size);
@@ -214,6 +506,7 @@ ByteBuffer PdcpLayer::process_rx(const ByteBuffer& pdu) {
     std::vector<uint8_t> payload(pdu.data.begin() + header_size,
                                   pdu.data.begin() + header_size + payload_size);
 
+
     // --- Step 4: Verify MAC-I ---
     if (config_.integrity_enabled) {
         uint32_t expected_mac_i = compute_mac_i(count, payload);
@@ -241,7 +534,17 @@ ByteBuffer PdcpLayer::process_rx(const ByteBuffer& pdu) {
         apply_cipher(payload, count);
     }
 
-    // --- Step 6: Return the recovered SDU ---
+    // ============================================================
+    // RX path modification (Member 2)
+    //
+    // Decompression is applied AFTER deciphering
+    // and BEFORE delivering SDU to upper layer.
+    // ============================================================
+    // --- Step 6: Decompression
+    if (config_.compression_enabled) {
+        payload = decompress_header(payload);
+    }
+    // --- Step 7: Return the recovered SDU ---
     ByteBuffer sdu;
     sdu.data = std::move(payload);
     return sdu;
