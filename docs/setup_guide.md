@@ -41,10 +41,10 @@ Open your WSL terminal (type `wsl` in PowerShell, or launch the Ubuntu app) and 
 
 ```bash
 sudo apt-get update
-sudo apt-get install -y build-essential cmake
+sudo apt-get install -y build-essential cmake libssl-dev
 ```
 
-`build-essential` installs g++, gcc, make, and standard C/C++ libraries. `cmake` is the build system generator.
+`build-essential` installs g++, gcc, make, and standard C/C++ libraries. `cmake` is the build system generator. `libssl-dev` provides OpenSSL headers and libraries required for PDCP security features (AES-128-CTR and HMAC-SHA256).
 
 Verify the installations:
 
@@ -183,6 +183,11 @@ sudo apt-get install -y cmake
 **`g++: command not found`**
 ```bash
 sudo apt-get install -y build-essential
+```
+
+**`Could NOT find OpenSSL` error during cmake**
+```bash
+sudo apt-get install -y libssl-dev libssl3
 ```
 
 **`fatal error: ... .h: No such file or directory`**
