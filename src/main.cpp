@@ -33,18 +33,42 @@
 // ============================================================
 // Simple command-line parser
 // ============================================================
-static Config parse_args(int argc, char* argv[]) {
+static Config parse_args(int argc, char* argv[], std::vector<uint32_t>& packet_sizes, bool& stress_mode) {
     Config cfg;
+    stress_mode = false;
+    
     for (int i = 1; i < argc; i++) {
         if (std::strcmp(argv[i], "--packet-size") == 0 && i + 1 < argc) {
             cfg.ip_packet_size = static_cast<uint32_t>(std::stoul(argv[++i]));
+        } else if (std::strcmp(argv[i], "--packet-sizes") == 0 && i + 1 < argc) {
+            // Parse comma-separated list: --packet-sizes 100,500,1000,1400
+            std::string sizes_str = argv[++i];
+            size_t pos = 0;
+            while (pos < sizes_str.length()) {
+                size_t comma = sizes_str.find(',', pos);
+                if (comma == std::string::npos) {
+                    packet_sizes.push_back(std::stoul(sizes_str.substr(pos)));
+                    break;
+                } else {
+                    packet_sizes.push_back(std::stoul(sizes_str.substr(pos, comma - pos)));
+                    pos = comma + 1;
+                }
+            }
         } else if (std::strcmp(argv[i], "--num-packets") == 0 && i + 1 < argc) {
             cfg.num_packets = static_cast<uint32_t>(std::stoul(argv[++i]));
         } else if (std::strcmp(argv[i], "--tb-size") == 0 && i + 1 < argc) {
             cfg.transport_block_size = static_cast<uint32_t>(std::stoul(argv[++i]));
+        } else if (std::strcmp(argv[i], "--stress") == 0) {
+            stress_mode = true;
+            cfg.num_packets = 100;  // Default stress test size
         } else {
             std::cerr << "Unknown option: " << argv[i] << "\n";
-            std::cerr << "Usage: 5g_layer2 [--packet-size N] [--num-packets N] [--tb-size N]\n";
+            std::cerr << "Usage: 5g_layer2 [options]\n";
+            std::cerr << "  --packet-size N         Single packet size in bytes\n";
+            std::cerr << "  --packet-sizes N,M,...  Variable packet sizes (comma-separated)\n";
+            std::cerr << "  --num-packets N         Number of packets to process\n";
+            std::cerr << "  --tb-size N             Transport Block size in bytes\n";
+            std::cerr << "  --stress                Run stress test (100+ packets)\n";
         }
     }
     return cfg;
@@ -78,13 +102,29 @@ struct PacketProfile {
 };
 
 int main(int argc, char* argv[]) {
-    Config cfg = parse_args(argc, argv);
+    std::vector<uint32_t> packet_sizes;
+    bool stress_mode = false;
+    Config cfg = parse_args(argc, argv, packet_sizes, stress_mode);
 
     std::cout << "========================================\n";
     std::cout << " 5G NR Layer 2 Protocol Stack Simulator\n";
     std::cout << "========================================\n";
-    std::cout << "  IP packet size   : " << cfg.ip_packet_size << " bytes\n";
+    
+    if (!packet_sizes.empty()) {
+        std::cout << "  Variable packet sizes: ";
+        for (size_t i = 0; i < packet_sizes.size(); i++) {
+            std::cout << packet_sizes[i];
+            if (i < packet_sizes.size() - 1) std::cout << ", ";
+        }
+        std::cout << " bytes\n";
+    } else {
+        std::cout << "  IP packet size   : " << cfg.ip_packet_size << " bytes\n";
+    }
+    
     std::cout << "  Number of packets: " << cfg.num_packets << "\n";
+    if (stress_mode) {
+        std::cout << "  Mode             : STRESS TEST\n";
+    }
     std::cout << "  Transport Block  : " << cfg.transport_block_size << " bytes\n";
     std::cout << "  PDCP SN length   : " << (int)cfg.pdcp_sn_length << " bits\n";
     std::cout << "  RLC mode         : UM (6-bit SN)\n";
@@ -95,6 +135,10 @@ int main(int argc, char* argv[]) {
 
     // Create layer instances
     IpGenerator ip_gen(cfg);
+    if (!packet_sizes.empty()) {
+        ip_gen.set_variable_sizes(packet_sizes);
+    }
+    
     PdcpLayer   pdcp(cfg);
     RlcLayer    rlc(cfg);
     MacLayer    mac(cfg);
@@ -106,11 +150,11 @@ int main(int argc, char* argv[]) {
     for (uint32_t seq = 0; seq < cfg.num_packets; seq++) {
         PacketProfile pp{};
         pp.seq = seq;
-        pp.packet_size = cfg.ip_packet_size;
-        pp.tb_size = cfg.transport_block_size;
-
-        // ---- Generate the original IP packet ----
+        
+        // Generate the original IP packet
         ByteBuffer original_ip = ip_gen.generate_packet(seq);
+        pp.packet_size = original_ip.size();
+        pp.tb_size = cfg.transport_block_size;
 
         // ============================================================
         // UPLINK PATH: IP → PDCP TX → RLC TX → MAC TX

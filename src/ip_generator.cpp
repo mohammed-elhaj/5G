@@ -4,12 +4,30 @@
 
 #include "ip_generator.h"
 #include <iostream>
+#include <cstdlib>
 
 IpGenerator::IpGenerator(const Config& cfg) : config_(cfg) {}
 
+void IpGenerator::set_variable_sizes(const std::vector<uint32_t>& sizes) {
+    variable_sizes_ = sizes;
+}
+
+void IpGenerator::set_payload_pattern(PayloadPattern pattern) {
+    payload_pattern_ = pattern;
+}
+
 ByteBuffer IpGenerator::generate_packet(uint32_t seq_num) {
-    // Total packet size = IPv4 header (20 bytes) + payload
+    // Determine packet size: use variable_sizes if set, otherwise config
     uint32_t total_size = config_.ip_packet_size;
+    if (!variable_sizes_.empty()) {
+        total_size = variable_sizes_[seq_num % variable_sizes_.size()];
+    }
+
+    // Minimum size: IPv4 header (20) + UDP header (8) = 28 bytes
+    if (total_size < 28) {
+        total_size = 28;
+    }
+
     ByteBuffer pkt;
     pkt.data.resize(total_size, 0);
 
@@ -39,11 +57,50 @@ ByteBuffer IpGenerator::generate_packet(uint32_t seq_num) {
     // Bytes 16-19: Destination IP = 10.0.0.2
     pkt.data[16] = 10; pkt.data[17] = 0; pkt.data[18] = 0; pkt.data[19] = 2;
 
-    // ---- Fill payload with a repeating pattern based on seq_num ----
-    // Pattern: each byte = (seq_num + byte_index) mod 256
-    // This is deterministic and easy to verify on the receive side.
-    for (uint32_t i = 20; i < total_size; i++) {
-        pkt.data[i] = static_cast<uint8_t>((seq_num + i) & 0xFF);
+    // ---- Build UDP header (8 bytes, offset 20-27) ----
+    uint32_t udp_length = total_size - 20;  // UDP length includes header + data
+    // Bytes 20-21: Source port = 5000 (big-endian)
+    pkt.data[20] = 0x13;
+    pkt.data[21] = 0x88;
+    // Bytes 22-23: Destination port = 6000 (big-endian)
+    pkt.data[22] = 0x17;
+    pkt.data[23] = 0x70;
+    // Bytes 24-25: UDP length (big-endian)
+    pkt.data[24] = static_cast<uint8_t>((udp_length >> 8) & 0xFF);
+    pkt.data[25] = static_cast<uint8_t>(udp_length & 0xFF);
+    // Bytes 26-27: UDP checksum = 0 (optional for IPv4)
+    pkt.data[26] = 0x00;
+    pkt.data[27] = 0x00;
+
+    // ---- Fill payload (starting at byte 28) with selected pattern ----
+    switch (payload_pattern_) {
+        case PayloadPattern::SEQUENTIAL:
+            // Pattern: each byte = (seq_num + byte_index) mod 256
+            for (uint32_t i = 28; i < total_size; i++) {
+                pkt.data[i] = static_cast<uint8_t>((seq_num + i) & 0xFF);
+            }
+            break;
+
+        case PayloadPattern::RANDOM:
+            // Pseudo-random based on seq_num as seed
+            {
+                uint32_t seed = seq_num * 0x9E3779B9;  // Golden ratio multiplier
+                for (uint32_t i = 28; i < total_size; i++) {
+                    seed = seed * 1103515245 + 12345;  // LCG
+                    pkt.data[i] = static_cast<uint8_t>((seed >> 16) & 0xFF);
+                }
+            }
+            break;
+
+        case PayloadPattern::ALL_ZEROS:
+            // Already zeroed by resize
+            break;
+
+        case PayloadPattern::ALL_ONES:
+            for (uint32_t i = 28; i < total_size; i++) {
+                pkt.data[i] = 0xFF;
+            }
+            break;
     }
 
     return pkt;

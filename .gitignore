@@ -16,9 +16,6 @@ CMakeFiles/
 cmake_install.cmake
 Makefile
 
-# Profiling output (regenerated on each run)
-profiling_results.csv
-profiling_*.csv
 
 # Plan document
 plan.md
