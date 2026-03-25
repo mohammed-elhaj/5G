@@ -8,6 +8,8 @@ MacLayer::MacLayer(const Config& cfg) : config_(cfg) {}
 void MacLayer::reset() {
 }
 
+// Write one MAC subPDU (R/F/LCID header + length + SDU payload) into the transport block.
+// Returns total bytes written (header + payload), or 0 if insufficient space (TS 38.321 §6.1.2).
 static size_t write_sdu(std::vector<uint8_t>& tb_data, size_t pos, size_t tb_size,
                         uint8_t lcid, const ByteBuffer& sdu) {
     uint32_t sdu_len     = static_cast<uint32_t>(sdu.size());
@@ -16,6 +18,7 @@ static size_t write_sdu(std::vector<uint8_t>& tb_data, size_t pos, size_t tb_siz
 
     if (pos + hdr_size + sdu_len > tb_size) return 0;
 
+    // R/F/LCID byte: F=1 for 16-bit length, F=0 for 8-bit length (TS 38.321 §6.1.2)
     uint8_t byte0 = lcid & 0x3F;
     if (long_format) byte0 |= 0x40;
     tb_data[pos++] = byte0;
@@ -31,6 +34,7 @@ static size_t write_sdu(std::vector<uint8_t>& tb_data, size_t pos, size_t tb_siz
     return hdr_size + sdu_len;
 }
 
+// Single-channel convenience wrapper: wrap SDUs into one LcData and delegate to multi-channel process_tx.
 ByteBuffer MacLayer::process_tx(const std::vector<ByteBuffer>& sdus, size_t tb_size) {
     LcData lc;
     lc.lcid      = config_.logical_channel_id;
@@ -48,6 +52,7 @@ ByteBuffer MacLayer::process_tx(std::vector<LcData> channels, size_t tb_size) {
 
     size_t pos = 0;
 
+    // Insert Buffer Status Report MAC CE if enabled (TS 38.321 §6.1.3.1)
     if (config_.bsr_enabled && pos + 2 <= effective_tb_size) {
         tb.data[pos++] = LCID_BSR;
         const uint8_t lcg_id       = 1;
@@ -55,7 +60,9 @@ ByteBuffer MacLayer::process_tx(std::vector<LcData> channels, size_t tb_size) {
         tb.data[pos++] = static_cast<uint8_t>((lcg_id << 5) | (buffer_index & 0x1F));
     }
 
+    // Logical Channel Prioritization (LCP) scheduling per TS 38.321 §5.4.3.1
     if (config_.lcp_enabled) {
+        // Sort channels by priority ascending (lower value = higher priority)
         std::sort(channels.begin(), channels.end(),
                   [](const LcData& a, const LcData& b) {
                       return a.priority < b.priority;
@@ -70,6 +77,7 @@ ByteBuffer MacLayer::process_tx(std::vector<LcData> channels, size_t tb_size) {
 
         bool tb_full = false;
 
+        // Phase 1: serve each channel up to its PBR quota in priority order
         for (size_t ci = 0; ci < num_ch && !tb_full; ++ci) {
             const LcData& ch = channels[ci];
             while (sdu_idx[ci] < ch.sdus.size() && !tb_full) {
@@ -83,6 +91,7 @@ ByteBuffer MacLayer::process_tx(std::vector<LcData> channels, size_t tb_size) {
             }
         }
 
+        // Phase 2: round-robin across all channels for remaining SDUs
         bool any_left = true;
         while (any_left && !tb_full) {
             any_left = false;
@@ -99,6 +108,7 @@ ByteBuffer MacLayer::process_tx(std::vector<LcData> channels, size_t tb_size) {
         }
 
     } else {
+        // No LCP: pack SDUs in channel order until TB is full
         bool tb_full = false;
         for (const auto& ch : channels) {
             for (const auto& sdu : ch.sdus) {
@@ -115,6 +125,7 @@ ByteBuffer MacLayer::process_tx(std::vector<LcData> channels, size_t tb_size) {
         }
     }
 
+    // Fill remaining space with padding subheader (TS 38.321 §6.1.2)
     if (pos < effective_tb_size) {
         tb.data[pos] = LCID_PADDING;
         if (pos + 1 < effective_tb_size)
@@ -124,6 +135,7 @@ ByteBuffer MacLayer::process_tx(std::vector<LcData> channels, size_t tb_size) {
     return tb;
 }
 
+// Demultiplex transport block into SDUs, discarding LCID information (TS 38.321 §6.1.2).
 std::vector<ByteBuffer> MacLayer::process_rx(const ByteBuffer& transport_block) {
     size_t tb_size = transport_block.size();
     std::vector<ByteBuffer> sdus;
@@ -136,11 +148,13 @@ std::vector<ByteBuffer> MacLayer::process_rx(const ByteBuffer& transport_block) 
 
         if (lcid == LCID_PADDING) break;
 
+        // Skip MAC CEs (e.g., BSR)
         if (lcid == LCID_BSR) {
             if (pos < tb_size) pos++;
             continue;
         }
 
+        // Parse length field: F=1 → 16-bit, F=0 → 8-bit (TS 38.321 §6.1.2)
         bool f_bit = (byte0 >> 6) & 0x01;
 
         uint32_t sdu_len = 0;
@@ -169,6 +183,7 @@ std::vector<ByteBuffer> MacLayer::process_rx(const ByteBuffer& transport_block) 
     return sdus;
 }
 
+// Demultiplex transport block into (LCID, SDU) pairs for multi-channel reception (TS 38.321 §6.1.2).
 std::vector<std::pair<uint8_t, ByteBuffer>>
 MacLayer::process_rx_multi(const ByteBuffer& transport_block) {
     size_t tb_size = transport_block.size();
@@ -182,6 +197,7 @@ MacLayer::process_rx_multi(const ByteBuffer& transport_block) {
 
         if (lcid == LCID_PADDING) break;
 
+        // Skip MAC CEs (e.g., BSR)
         if (lcid == LCID_BSR) {
             if (pos < tb_size) {
                 uint8_t bsr_val = transport_block.data[pos++];
@@ -190,6 +206,7 @@ MacLayer::process_rx_multi(const ByteBuffer& transport_block) {
             continue;
         }
 
+        // Parse length field: F=1 → 16-bit, F=0 → 8-bit (TS 38.321 §6.1.2)
         bool f_bit = (byte0 >> 6) & 0x01;
 
         uint32_t sdu_len = 0;

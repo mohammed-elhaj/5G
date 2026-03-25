@@ -37,6 +37,7 @@ static bool buffers_equal(const ByteBuffer& a, const ByteBuffer& b) {
     return std::memcmp(a.data.data(), b.data.data(), a.size()) == 0;
 }
 
+// Verify single small SDU uses 8-bit length field and round-trips correctly.
 static void test_single_small_sdu() {
     TEST("Single small SDU (100 bytes, 8-bit L)");
 
@@ -69,6 +70,7 @@ static void test_single_small_sdu() {
     PASS();
 }
 
+// Verify single large SDU (>255B) uses 16-bit length field and round-trips correctly.
 static void test_single_large_sdu() {
     TEST("Single large SDU (500 bytes, 16-bit L)");
 
@@ -90,6 +92,7 @@ static void test_single_large_sdu() {
     PASS();
 }
 
+// Verify multiple SDUs are correctly multiplexed and demultiplexed in order.
 static void test_multiple_sdus() {
     TEST("Multiple SDUs (3 SDUs in one TB)");
 
@@ -122,6 +125,7 @@ static void test_multiple_sdus() {
     PASS();
 }
 
+// Verify mixed SDU sizes (crossing 8-bit/16-bit length threshold) are handled correctly.
 static void test_mixed_sizes() {
     TEST("Mixed SDU sizes (50, 300, 150 bytes)");
 
@@ -154,6 +158,7 @@ static void test_mixed_sizes() {
     PASS();
 }
 
+// Verify padding subheader (LCID=63) fills unused TB space after SDUs.
 static void test_padding() {
     TEST("Padding fills remaining TB space");
 
@@ -185,6 +190,7 @@ static void test_padding() {
     PASS();
 }
 
+// Verify multi-LCID multiplexing and demultiplexing preserves LCID tags and SDU order.
 static void test_multi_lcid_mux_demux() {
     TEST("Multi-LCID mux/demux (LCID 4 + LCID 5, 2 SDUs each)");
 
@@ -218,6 +224,7 @@ static void test_multi_lcid_mux_demux() {
     PASS();
 }
 
+// Verify LCP sorts channels by priority (lower value = higher priority) before scheduling.
 static void test_lcp_priority_ordering() {
     TEST("LCP priority ordering (LCID 4 prio=1 appears before LCID 5 prio=2)");
 
@@ -248,6 +255,7 @@ static void test_lcp_priority_ordering() {
     PASS();
 }
 
+// Verify LCP PBR phase caps each channel at its quota, then round-robin serves remaining SDUs.
 static void test_lcp_pbr_quota() {
     TEST("LCP PBR quota (LCID 4 capped at 100B, remainder via round-robin)");
 
@@ -281,6 +289,7 @@ static void test_lcp_pbr_quota() {
     PASS();
 }
 
+// Verify LCP round-robin phase cycles fairly across 3 channels after PBR phase completes.
 static void test_lcp_3channel_roundrobin() {
     TEST("LCP round-robin cycles across 3 channels (LCID 4/5/6, pbr=60B, 4 SDUs each)");
 
@@ -543,6 +552,7 @@ static void profile_variants() {
     std::cout << std::endl;
 }
 
+// Verify BSR MAC CE (LCID=61) is inserted at TB start when bsr_enabled=true.
 static void test_bsr_in_pdu() {
     TEST("BSR CE (LCID=61) present in TB when bsr_enabled=true");
 
@@ -568,6 +578,7 @@ static void test_bsr_in_pdu() {
     PASS();
 }
 
+// Verify process_tx respects tb_size parameter override instead of config default.
 static void test_variable_tb_size() {
     TEST("Variable TB size override (process_tx with tb_size=200)");
 
@@ -591,6 +602,7 @@ static void test_variable_tb_size() {
     PASS();
 }
 
+// Verify graceful truncation when TB is too small to fit any SDU.
 static void test_tb_too_small_truncation() {
     TEST("Truncation: TB too small for SDU (tb_size=10, SDU=100B)");
 

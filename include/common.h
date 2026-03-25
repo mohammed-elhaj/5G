@@ -50,9 +50,9 @@ struct Config {
     // --- MAC (TS 38.321 simplified) ---
     uint8_t  logical_channel_id   = 4;       // DTCH (LCID 4 for first DRB)
     uint32_t transport_block_size = 2048;    // fixed TB size for V1
-    uint8_t  num_logical_channels = 1;       // Pair C: multi-LCID support
-    bool     lcp_enabled          = false;   // Pair C: Logical Channel Prioritization
-    bool     bsr_enabled          = false;   // Pair C: Buffer Status Report
+    uint8_t  num_logical_channels = 1;       // number of logical channels to multiplex (default 1)
+    bool     lcp_enabled          = false;   // enable Logical Channel Prioritization (PBR + round-robin, TS 38.321 §5.4.3.1, default off)
+    bool     bsr_enabled          = false;   // insert Buffer Status Report MAC CE (LCID=61, TS 38.321 §6.1.3.1, default off)
 
     // --- RLC AM extensions (Pair B, Member 3) ---
     uint8_t  rlc_am_sn_length    = 12;     // SN bit-width for AM mode (always 12 per TS 38.322)
@@ -84,10 +84,10 @@ struct Config {
 // Pair C: Logical Channel Data for multi-LCID multiplexing
 // ============================================================
 struct LcData {
-    uint8_t                 lcid      = 4;
-    uint8_t                 priority  = 0;
-    uint32_t                pbr_bytes = 0xFFFFFFFF;
-    std::vector<ByteBuffer> sdus;
+    uint8_t                 lcid      = 4;          // logical channel ID (TS 38.321 §6.2.1)
+    uint8_t                 priority  = 0;          // scheduling priority (lower = higher priority, TS 38.321 §5.4.3.1)
+    uint32_t                pbr_bytes = 0xFFFFFFFF; // prioritized bit rate quota in bytes (0xFFFFFFFF = infinite)
+    std::vector<ByteBuffer> sdus;                   // SDUs queued for this logical channel
 };
 
 // ============================================================
