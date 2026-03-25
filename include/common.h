@@ -48,6 +48,20 @@ struct Config {
     uint32_t rlc_max_pdu_size    = 500;     // simulates MAC grant size
 
     // --- MAC (TS 38.321 simplified) ---
+    uint8_t  logical_channel_id   = 4;       // DTCH (LCID 4 for first DRB)
+    uint32_t transport_block_size = 2048;    // fixed TB size for V1
+
+    uint8_t  num_logical_channels = 1;
+    bool     lcp_enabled          = false;
+
+    bool     bsr_enabled          = false;
+};
+
+struct LcData {
+    uint8_t               lcid      = 4;
+    uint8_t               priority  = 0;
+    uint32_t              pbr_bytes = 0xFFFFFFFF;
+    std::vector<ByteBuffer> sdus;
     uint8_t  logical_channel_id  = 4;       // DTCH (LCID 4 for first DRB)
     uint32_t transport_block_size = 2048;   // fixed TB size for V1
 

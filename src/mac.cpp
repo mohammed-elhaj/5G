@@ -1,128 +1,159 @@
-// ============================================================
-// mac.cpp — MAC Layer implementation (TS 38.321 simplified)
-//
-// NR MAC PDU structure (subheaders inline with payloads):
-//   [subheader_1][payload_1][subheader_2][payload_2]...[padding_subheader][padding_bytes]
-//
-// Unlike LTE (where all subheaders are grouped at the front),
-// NR places each subheader immediately before its payload.
-// This simplifies both packing and parsing.
-// ============================================================
-
 #include "mac.h"
+#include <algorithm>
 #include <cstring>
 #include <iostream>
 
 MacLayer::MacLayer(const Config& cfg) : config_(cfg) {}
 
 void MacLayer::reset() {
-    // MAC is stateless in V1 (no HARQ buffers, no BSR state)
 }
 
-// ============================================================
-// TX path — Multiplexing
-//
-// For each MAC SDU (RLC PDU):
-//   1. Determine F bit: F=0 if SDU ≤ 255 bytes, F=1 otherwise
-//   2. Write the subheader: [R=0][F][LCID(6)]  then L (1 or 2 bytes)
-//   3. Copy the SDU payload
-//
-// After all SDUs, if there is remaining space in the Transport
-// Block, write a padding subheader (LCID=63) and fill with zeros.
-// ============================================================
-ByteBuffer MacLayer::process_tx(const std::vector<ByteBuffer>& sdus) {
+static size_t write_sdu(std::vector<uint8_t>& tb_data, size_t pos, size_t tb_size,
+                        uint8_t lcid, const ByteBuffer& sdu) {
+    uint32_t sdu_len     = static_cast<uint32_t>(sdu.size());
+    bool     long_format = (sdu_len > 255);
+    size_t   hdr_size    = long_format ? 3 : 2;
+
+    if (pos + hdr_size + sdu_len > tb_size) return 0;
+
+    uint8_t byte0 = lcid & 0x3F;
+    if (long_format) byte0 |= 0x40;
+    tb_data[pos++] = byte0;
+
+    if (long_format) {
+        tb_data[pos++] = static_cast<uint8_t>((sdu_len >> 8) & 0xFF);
+        tb_data[pos++] = static_cast<uint8_t>(sdu_len & 0xFF);
+    } else {
+        tb_data[pos++] = static_cast<uint8_t>(sdu_len & 0xFF);
+    }
+
+    std::memcpy(tb_data.data() + pos, sdu.data.data(), sdu_len);
+    return hdr_size + sdu_len;
+}
+
+ByteBuffer MacLayer::process_tx(const std::vector<ByteBuffer>& sdus, size_t tb_size) {
+    LcData lc;
+    lc.lcid      = config_.logical_channel_id;
+    lc.priority  = 0;
+    lc.pbr_bytes = 0xFFFFFFFF;
+    lc.sdus      = sdus;
+    return process_tx({lc}, tb_size);
+}
+
+ByteBuffer MacLayer::process_tx(std::vector<LcData> channels, size_t tb_size) {
     ByteBuffer tb;
-    tb.data.resize(config_.transport_block_size, 0x00);  // pre-fill with zeros
+    size_t effective_tb_size = (tb_size > 0) ? tb_size : config_.transport_block_size;
+
+    tb.data.resize(effective_tb_size);
 
     size_t pos = 0;
 
-    for (const auto& sdu : sdus) {
-        uint32_t sdu_len = static_cast<uint32_t>(sdu.size());
-        bool long_format = (sdu_len > 255);   // F=1 for long SDUs
-
-        // Subheader size: 1 byte (R/F/LCID) + 1 or 2 bytes (L field)
-        size_t subheader_size = long_format ? 3 : 2;
-        size_t total_needed   = subheader_size + sdu_len;
-
-        // Safety check: do we have room?
-        if (pos + total_needed > config_.transport_block_size) {
-            std::cerr << "  [MAC TX] WARNING: Transport Block overflow, skipping SDU of "
-                      << sdu_len << " bytes\n";
-            continue;
-        }
-
-        // --- Write the subheader ---
-        // Byte 0: [R=0(1 bit)][F(1 bit)][LCID(6 bits)]
-        uint8_t byte0 = config_.logical_channel_id & 0x3F;
-        if (long_format) {
-            byte0 |= 0x40;   // Set the F bit (bit 6)
-        }
-        tb.data[pos++] = byte0;
-
-        // Length field (big-endian for 16-bit)
-        if (long_format) {
-            tb.data[pos++] = static_cast<uint8_t>((sdu_len >> 8) & 0xFF);
-            tb.data[pos++] = static_cast<uint8_t>(sdu_len & 0xFF);
-        } else {
-            tb.data[pos++] = static_cast<uint8_t>(sdu_len & 0xFF);
-        }
-
-        // --- Copy the SDU payload ---
-        std::memcpy(tb.data.data() + pos, sdu.data.data(), sdu_len);
-        pos += sdu_len;
+    if (config_.bsr_enabled && pos + 2 <= effective_tb_size) {
+        tb.data[pos++] = LCID_BSR;
+        const uint8_t lcg_id       = 1;
+        const uint8_t buffer_index = 15;
+        tb.data[pos++] = static_cast<uint8_t>((lcg_id << 5) | (buffer_index & 0x1F));
     }
 
-    // --- Add padding subheader if there is remaining space ---
-    if (pos < config_.transport_block_size) {
-        // Padding subheader: [R=0][F=0][LCID=63]
-        tb.data[pos++] = LCID_PADDING;
-        // Remaining bytes are already zero (padding)
+    if (config_.lcp_enabled) {
+        std::sort(channels.begin(), channels.end(),
+                  [](const LcData& a, const LcData& b) {
+                      return a.priority < b.priority;
+                  });
+
+        const size_t num_ch = channels.size();
+        std::vector<size_t>   sdu_idx(num_ch, 0);
+        std::vector<uint32_t> pbr_rem;
+        pbr_rem.reserve(num_ch);
+        for (const auto& ch : channels)
+            pbr_rem.push_back(ch.pbr_bytes);
+
+        bool tb_full = false;
+
+        for (size_t ci = 0; ci < num_ch && !tb_full; ++ci) {
+            const LcData& ch = channels[ci];
+            while (sdu_idx[ci] < ch.sdus.size() && !tb_full) {
+                const ByteBuffer& sdu = ch.sdus[sdu_idx[ci]];
+                if (sdu.size() > pbr_rem[ci]) break;
+                size_t written = write_sdu(tb.data, pos, effective_tb_size, ch.lcid, sdu);
+                if (written == 0) { tb_full = true; break; }
+                pbr_rem[ci] -= static_cast<uint32_t>(sdu.size());
+                pos += written;
+                sdu_idx[ci]++;
+            }
+        }
+
+        bool any_left = true;
+        while (any_left && !tb_full) {
+            any_left = false;
+            for (size_t ci = 0; ci < num_ch && !tb_full; ++ci) {
+                const LcData& ch = channels[ci];
+                if (sdu_idx[ci] >= ch.sdus.size()) continue;
+                any_left = true;
+                const ByteBuffer& sdu = ch.sdus[sdu_idx[ci]];
+                size_t written = write_sdu(tb.data, pos, effective_tb_size, ch.lcid, sdu);
+                if (written == 0) { tb_full = true; break; }
+                pos += written;
+                sdu_idx[ci]++;
+            }
+        }
+
+    } else {
+        bool tb_full = false;
+        for (const auto& ch : channels) {
+            for (const auto& sdu : ch.sdus) {
+                size_t written = write_sdu(tb.data, pos, effective_tb_size, ch.lcid, sdu);
+                if (written == 0) {
+                    std::cerr << "  [MAC TX] TB full (" << effective_tb_size
+                              << "B). Truncating remaining SDUs.\n";
+                    tb_full = true;
+                    break;
+                }
+                pos += written;
+            }
+            if (tb_full) break;
+        }
+    }
+
+    if (pos < effective_tb_size) {
+        tb.data[pos] = LCID_PADDING;
+        if (pos + 1 < effective_tb_size)
+            std::fill(tb.data.begin() + pos + 1, tb.data.end(), 0x00);
     }
 
     return tb;
 }
 
-// ============================================================
-// RX path — Demultiplexing
-//
-// Walk through the Transport Block byte-by-byte:
-//   1. Read the subheader byte: extract F bit and LCID
-//   2. If LCID == 63 → padding, stop parsing
-//   3. Read the length field (1 or 2 bytes depending on F)
-//   4. Extract L bytes of SDU payload
-//   5. Deliver the SDU to the output vector
-// ============================================================
 std::vector<ByteBuffer> MacLayer::process_rx(const ByteBuffer& transport_block) {
-    std::vector<ByteBuffer> sdus;
-    size_t pos = 0;
     size_t tb_size = transport_block.size();
+    std::vector<ByteBuffer> sdus;
+    sdus.reserve(tb_size / 3);
 
+    size_t pos = 0;
     while (pos < tb_size) {
-        // --- Read the subheader byte ---
         uint8_t byte0 = transport_block.data[pos++];
         uint8_t lcid  = byte0 & 0x3F;
-        bool    f_bit = (byte0 >> 6) & 0x01;
 
-        // Check for padding LCID — stop parsing
-        if (lcid == LCID_PADDING) {
-            break;
+        if (lcid == LCID_PADDING) break;
+
+        if (lcid == LCID_BSR) {
+            if (pos < tb_size) pos++;
+            continue;
         }
 
-        // --- Read the length field ---
+        bool f_bit = (byte0 >> 6) & 0x01;
+
         uint32_t sdu_len = 0;
         if (f_bit) {
-            // 16-bit length (big-endian)
             if (pos + 2 > tb_size) break;
             sdu_len = (static_cast<uint32_t>(transport_block.data[pos]) << 8) |
                        static_cast<uint32_t>(transport_block.data[pos + 1]);
             pos += 2;
         } else {
-            // 8-bit length
             if (pos + 1 > tb_size) break;
             sdu_len = transport_block.data[pos++];
         }
 
-        // --- Extract the SDU payload ---
         if (pos + sdu_len > tb_size) {
             std::cerr << "  [MAC RX] WARNING: SDU extends beyond TB boundary\n";
             break;
@@ -132,9 +163,57 @@ std::vector<ByteBuffer> MacLayer::process_rx(const ByteBuffer& transport_block) 
         sdu.data.assign(transport_block.data.begin() + pos,
                         transport_block.data.begin() + pos + sdu_len);
         pos += sdu_len;
-
         sdus.push_back(std::move(sdu));
     }
 
     return sdus;
+}
+
+std::vector<std::pair<uint8_t, ByteBuffer>>
+MacLayer::process_rx_multi(const ByteBuffer& transport_block) {
+    size_t tb_size = transport_block.size();
+    std::vector<std::pair<uint8_t, ByteBuffer>> result;
+    result.reserve(tb_size / 3);
+
+    size_t pos = 0;
+    while (pos < tb_size) {
+        uint8_t byte0 = transport_block.data[pos++];
+        uint8_t lcid  = byte0 & 0x3F;
+
+        if (lcid == LCID_PADDING) break;
+
+        if (lcid == LCID_BSR) {
+            if (pos < tb_size) {
+                uint8_t bsr_val = transport_block.data[pos++];
+                (void)bsr_val;
+            }
+            continue;
+        }
+
+        bool f_bit = (byte0 >> 6) & 0x01;
+
+        uint32_t sdu_len = 0;
+        if (f_bit) {
+            if (pos + 2 > tb_size) break;
+            sdu_len = (static_cast<uint32_t>(transport_block.data[pos]) << 8) |
+                       static_cast<uint32_t>(transport_block.data[pos + 1]);
+            pos += 2;
+        } else {
+            if (pos + 1 > tb_size) break;
+            sdu_len = transport_block.data[pos++];
+        }
+
+        if (pos + sdu_len > tb_size) {
+            std::cerr << "  [MAC RX] WARNING: SDU extends beyond TB boundary\n";
+            break;
+        }
+
+        ByteBuffer sdu;
+        sdu.data.assign(transport_block.data.begin() + pos,
+                        transport_block.data.begin() + pos + sdu_len);
+        pos += sdu_len;
+        result.emplace_back(lcid, std::move(sdu));
+    }
+
+    return result;
 }
