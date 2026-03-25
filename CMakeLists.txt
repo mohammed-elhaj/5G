@@ -72,12 +72,21 @@ endif()
 
 # Target: generate_charts
 # Generates charts from profiling_results.csv
-add_custom_target(generate_charts
-    COMMAND ${CMAKE_COMMAND} -E echo "Generating profiling charts..."
-    COMMAND python ${CMAKE_SOURCE_DIR}/scripts/generate_charts.py
-    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
-    COMMENT "Generating charts from profiling data"
-)
+if(WIN32)
+    add_custom_target(generate_charts
+        COMMAND ${CMAKE_COMMAND} -E echo "Generating profiling charts..."
+        COMMAND python ${CMAKE_SOURCE_DIR}/scripts/generate_charts.py
+        WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+        COMMENT "Generating charts from profiling data"
+    )
+else()
+    add_custom_target(generate_charts
+        COMMAND ${CMAKE_COMMAND} -E echo "Generating profiling charts..."
+        COMMAND python3 ${CMAKE_SOURCE_DIR}/scripts/generate_charts.py
+        WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+        COMMENT "Generating charts from profiling data"
+    )
+endif()
 
 # Target: profile
 # Complete profiling workflow: run profiling + generate charts

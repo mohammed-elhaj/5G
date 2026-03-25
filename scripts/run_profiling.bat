@@ -52,14 +52,22 @@ REM Run all combinations
 for %%T in (%TB_SIZES%) do (
     for %%P in (%PACKET_SIZES%) do (
         set /a CURRENT_RUN+=1
-        echo [!CURRENT_RUN!/%TOTAL_RUNS%] TB=%%T, Packet=%%P
         
-        REM Run the simulator (suppress output)
-        %BINARY% --tb-size %%T --packet-size %%P --num-packets %NUM_PACKETS% > nul 2>&1
-        
-        REM Move generated CSV to temp location
-        if exist "%OUTPUT_CSV%" (
-            move /y "%OUTPUT_CSV%" "%TEMP_DIR%\run_!CURRENT_RUN!.csv" > nul
+        REM Skip configurations where packet + overhead exceeds TB
+        REM Overhead estimate: PDCP (7-12) + RLC (2-3) + MAC (2-3) = ~20 bytes
+        set /a MIN_TB_SIZE=%%P + 20
+        if %%T LSS !MIN_TB_SIZE! (
+            echo [!CURRENT_RUN!/%TOTAL_RUNS%] TB=%%T, Packet=%%P [SKIPPED - TB too small]
+        ) else (
+            echo [!CURRENT_RUN!/%TOTAL_RUNS%] TB=%%T, Packet=%%P
+            
+            REM Run the simulator (suppress output)
+            %BINARY% --tb-size %%T --packet-size %%P --num-packets %NUM_PACKETS% > nul 2>&1
+            
+            REM Move generated CSV to temp location
+            if exist "%OUTPUT_CSV%" (
+                move /y "%OUTPUT_CSV%" "%TEMP_DIR%\run_!CURRENT_RUN!.csv" > nul
+            )
         )
     )
 )

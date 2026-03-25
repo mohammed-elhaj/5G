@@ -50,20 +50,9 @@ struct Config {
     // --- MAC (TS 38.321 simplified) ---
     uint8_t  logical_channel_id   = 4;       // DTCH (LCID 4 for first DRB)
     uint32_t transport_block_size = 2048;    // fixed TB size for V1
-
-    uint8_t  num_logical_channels = 1;
-    bool     lcp_enabled          = false;
-
-    bool     bsr_enabled          = false;
-};
-
-struct LcData {
-    uint8_t               lcid      = 4;
-    uint8_t               priority  = 0;
-    uint32_t              pbr_bytes = 0xFFFFFFFF;
-    std::vector<ByteBuffer> sdus;
-    uint8_t  logical_channel_id  = 4;       // DTCH (LCID 4 for first DRB)
-    uint32_t transport_block_size = 2048;   // fixed TB size for V1
+    uint8_t  num_logical_channels = 1;       // Pair C: multi-LCID support
+    bool     lcp_enabled          = false;   // Pair C: Logical Channel Prioritization
+    bool     bsr_enabled          = false;   // Pair C: Buffer Status Report
 
     // --- RLC AM extensions (Pair B, Member 3) ---
     uint8_t  rlc_am_sn_length    = 12;     // SN bit-width for AM mode (always 12 per TS 38.322)
@@ -83,11 +72,22 @@ struct LcData {
     // Columns: pkt_size, variant, iteration, tx_us, rx_us, pass
     // Default empty = no CSV output.
     std::string benchmark_csv_path = "";
+
     // === Member 1: PDCP algorithm selection ===
     // 0 = V1 originals (XOR cipher, CRC32 integrity)
     // 1 = Optimized (AES-128-CTR cipher, HMAC-SHA256 integrity)
     uint8_t  cipher_algorithm    = 0;  // 0 = XOR (V1 default), 1 = AES-128-CTR
     uint8_t  integrity_algorithm = 0;  // 0 = CRC32 (V1 default), 1 = HMAC-SHA256
+};
+
+// ============================================================
+// Pair C: Logical Channel Data for multi-LCID multiplexing
+// ============================================================
+struct LcData {
+    uint8_t                 lcid      = 4;
+    uint8_t                 priority  = 0;
+    uint32_t                pbr_bytes = 0xFFFFFFFF;
+    std::vector<ByteBuffer> sdus;
 };
 
 // ============================================================

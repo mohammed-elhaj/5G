@@ -1,6 +1,4 @@
 # Build directory
-build/
-
 # Object files
 *.o
 *.obj

@@ -9,7 +9,7 @@
 # All results are appended to profiling_results.csv
 # ============================================================
 
-set -e  # Exit on error
+set -e  # Exit on erro
 
 # Configuration
 BINARY="./5g_layer2"
@@ -24,7 +24,7 @@ PACKET_SIZES=(100 500 1000 1400 3000)
 GREEN='\033[0;32m'
 BLUE='\033[0;34m'
 YELLOW='\033[1;33m'
-NC='\033[0m' # No Color
+NC='\033[0m' # No Colo
 
 echo "========================================"
 echo "  5G Layer 2 Profiling Suite"
@@ -62,9 +62,17 @@ for TB_SIZE in "${TB_SIZES[@]}"; do
     for PACKET_SIZE in "${PACKET_SIZES[@]}"; do
         CURRENT_RUN=$((CURRENT_RUN + 1))
         
+        # Skip configurations where packet + overhead exceeds TB
+        # Overhead estimate: PDCP (7-12 bytes) + RLC (2-3 bytes) + MAC (2-3 bytes) ≈ 20 bytes
+        MIN_TB_SIZE=$((PACKET_SIZE + 20))
+        if [ $TB_SIZE -lt $MIN_TB_SIZE ]; then
+            echo -e "${YELLOW}[$CURRENT_RUN/$TOTAL_RUNS]${NC} TB=$TB_SIZE, Packet=$PACKET_SIZE ${YELLOW}[SKIPPED - TB too small]${NC}"
+            continue
+        fi
+        
         echo -e "${GREEN}[$CURRENT_RUN/$TOTAL_RUNS]${NC} TB=$TB_SIZE, Packet=$PACKET_SIZE"
         
-        # Run the simulator
+        # Run the simulato
         TEMP_CSV="$TEMP_DIR/run_${CURRENT_RUN}.csv"
         $BINARY --tb-size $TB_SIZE --packet-size $PACKET_SIZE --num-packets $NUM_PACKETS > /dev/null
         
